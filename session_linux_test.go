@@ -146,7 +146,7 @@ func TestLinuxTunPacketHandoff(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	s, err := Open(ctx, Config{
-		Command:    []string{"/bin/bash", "-c", "printf probe >/dev/udp/198.18.0.1/5353"},
+		Command:    []string{"/bin/bash", "-c", "printf probe >/dev/udp/172.31.254.1/5353; sleep 1"},
 		Credential: unprivileged(),
 	})
 	if err != nil {
