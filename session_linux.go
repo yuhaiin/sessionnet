@@ -12,8 +12,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -76,18 +74,6 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	ipPath, err := exec.LookPath("ip")
-	if err != nil {
-		return nil, fmt.Errorf("sessionnet: iproute2 is required: %w", err)
-	}
-	nsenterPath, err := exec.LookPath("nsenter")
-	if err != nil {
-		return nil, fmt.Errorf("sessionnet: util-linux nsenter is required: %w", err)
-	}
-	mountPath, err := exec.LookPath("mount")
-	if err != nil {
-		return nil, fmt.Errorf("sessionnet: mount is required: %w", err)
-	}
 	name, err := randomInterfaceName()
 	if err != nil {
 		return nil, err
@@ -148,72 +134,15 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 			_ = s.Close()
 		}
 	}()
-	pid := strconv.Itoa(cmd.Process.Pid)
-	run := func(path string, args ...string) error {
-		command := exec.CommandContext(ctx, path, args...)
-		command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C"}
-		output, runErr := command.CombinedOutput()
-		if runErr != nil {
-			return fmt.Errorf("%s %s: %w: %s", filepath.Base(path), strings.Join(args, " "), runErr, strings.TrimSpace(string(output)))
-		}
-		return nil
-	}
-	enter := func(args ...string) error {
-		return run(nsenterPath, append([]string{"-t", pid, "-n", "--", ipPath}, args...)...)
-	}
-	// Interface starts in the host namespace without any routes; move it
-	// into the private namespace while keeping the host-side FD open.
-	if err = run(ipPath, "link", "set", "dev", name, "netns", pid); err != nil {
-		return nil, err
-	}
-	if err = enter("link", "set", "dev", "lo", "up"); err != nil {
-		return nil, err
-	}
 	mtu := cfg.MTU
 	if mtu == 0 {
 		mtu = DefaultMTU
 	}
-	if err = enter("link", "set", "dev", name, "mtu", strconv.Itoa(mtu)); err != nil {
-		return nil, err
+	if err = configureNetwork(ctx, cmd.Process.Pid, name, mtu, cfg.IPv6); err != nil {
+		return nil, fmt.Errorf("sessionnet: configure isolated network: %w", err)
 	}
-	if err = enter("addr", "add", SessionIPv4, "dev", name); err != nil {
-		return nil, err
-	}
-	if cfg.IPv6 {
-		if err = enter("-6", "addr", "add", SessionIPv6, "dev", name, "nodad"); err != nil {
-			return nil, err
-		}
-	}
-	if err = enter("link", "set", "dev", name, "up"); err != nil {
-		return nil, err
-	}
-	if err = enter("route", "replace", "default", "dev", name); err != nil {
-		return nil, err
-	}
-	if cfg.IPv6 {
-		if err = enter("-6", "route", "replace", "default", "dev", name); err != nil {
-			return nil, err
-		}
-	}
-	// A separate mount namespace is required to bind-mount a resolver file
-	// without modifying the host's /etc/resolv.conf.
-	tmp, err := os.MkdirTemp("", "sessionnet-resolv-")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(tmp)
-	resolvPath := filepath.Join(tmp, "resolv.conf")
-	if err = os.WriteFile(resolvPath, []byte("nameserver "+GatewayIPv4+"\noptions timeout:2 attempts:2\n"), 0644); err != nil {
-		return nil, err
-	}
-	mountEnter := func(args ...string) error {
-		return run(nsenterPath, append([]string{"-t", pid, "-m", "--", mountPath}, args...)...)
-	}
-	if err = mountEnter("--make-rprivate", "/"); err != nil {
-		return nil, err
-	}
-	if err = mountEnter("--bind", resolvPath, "/etc/resolv.conf"); err != nil {
-		return nil, err
+	if err = configureResolver(cmd.Process.Pid); err != nil {
+		return nil, fmt.Errorf("sessionnet: configure isolated resolver: %w", err)
 	}
 	s.stopContext = context.AfterFunc(ctx, func() { _ = s.Close() })
 	if err = ctx.Err(); err != nil {
