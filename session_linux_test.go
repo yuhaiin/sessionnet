@@ -4,6 +4,7 @@ package sessionnet
 
 import (
 	"bytes"
+	"fmt"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -279,5 +280,67 @@ func TestAddressConfig(t *testing.T) {
 				t.Fatal("expected address validation failure")
 			}
 		})
+	}
+}
+
+// TestLinuxSharedNamespace verifies that concurrent commands inherit the
+// existing namespace, including its resolver, without allocating another TUN.
+func TestLinuxSharedNamespace(t *testing.T) {
+	if testing.Short() || os.Getenv("SESSIONNET_INTEGRATION") != "1" {
+		t.Skip("set SESSIONNET_INTEGRATION=1 on an appropriately privileged Linux host")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	stdin, keepalive, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	defer keepalive.Close()
+
+	owner, err := Open(ctx, Config{
+		Command: []string{"/bin/sh", "-c", "read -r done"},
+		Credential: unprivileged(), Stdin: stdin,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := owner.Release(); err != nil {
+		t.Fatal(err)
+	}
+	netNamespace, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/net", owner.PID()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mountNamespace, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/mnt", owner.PID()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first, second strings.Builder
+	for i, output := range []*strings.Builder{&first, &second} {
+		p, err := owner.Spawn(ctx, Config{
+			Command: []string{"/bin/sh", "-c", "readlink /proc/self/ns/net; readlink /proc/self/ns/mnt; cat /etc/resolv.conf"},
+			Credential: unprivileged(), Stdout: output,
+		})
+		if err != nil {
+			t.Fatalf("spawn %d: %v", i, err)
+		}
+		defer p.Close()
+		if err := p.Wait(); err != nil {
+			t.Fatalf("wait %d: %v", i, err)
+		}
+	}
+	for i, output := range []string{first.String(), second.String()} {
+		if !strings.Contains(output, netNamespace) ||
+			!strings.Contains(output, mountNamespace) ||
+			!strings.Contains(output, GatewayIPv4) {
+			t.Fatalf("spawn %d did not share namespace and resolver: %q", i, output)
+		}
+	}
+	select {
+	case <-owner.Done():
+		t.Fatal("owner exited before the shared network was closed")
+	default:
 	}
 }
