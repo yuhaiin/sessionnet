@@ -11,11 +11,25 @@
 1. Open a nonpersistent L3 TUN device with `IFF_TUN | IFF_NO_PI`.
 2. Start the session command behind a one-time startup gate in private network and mount namespaces as a non-root user.
 3. Move the TUN interface into that network namespace, configure IPv4 and optional IPv6 addresses, and set namespace-local default routes.
-4. Bind-mount an isolated `/etc/resolv.conf` with `198.18.0.1` as the DNS resolver. The host's DNS and routes are unchanged.
+4. Bind-mount an isolated `/etc/resolv.conf` with `172.31.254.1` as the DNS resolver. The host's DNS and routes are unchanged.
 5. Duplicate the TUN file descriptor into the supervising application's packet stack. Only after its packet handler is ready, call `Release()` to run the command.
 6. On cancellation or `Close()`, kill the session process group and release the owned TUN FD. The caller owns any duplicated FDs.
 
 There is no NAT, built-in DNS server, or Internet access in this module. **The supervising application's packet stack must forward traffic and answer DNS.** If initialization fails, `Open()` fails and does not expose the host network as a fallback.
+
+## Address selection
+
+The default IPv4 link is `172.31.254.1` (gateway) and `172.31.254.2/30`
+(session). The optional IPv6 link is `fd42:7d2a:9b31::1` (gateway) and
+`fd42:7d2a:9b31::2/64` (session). The defaults deliberately avoid the
+`198.18.0.0/15` FakeIP benchmark range, `2001:2::/48` FakeIP IPv6 range,
+and Tailscale's `fd7a:115c:a1e0::/48` ULA prefix.
+
+An integrator can provide `Config.Addresses` as `AddressConfig` to choose
+another /30 IPv4 and /64 IPv6 subnet. `Resolve(ipv6)` applies defaults and
+validates the network endpoints. **The embedding application must additionally
+check these links for overlap with its active FakeIP or VPN routes**; no
+hardcoded private subnet can guarantee avoiding every deployment-specific route.
 
 ## Requirements
 
@@ -59,7 +73,7 @@ func run(ctx context.Context, stackFactory func(*os.File) (func() error, error))
 }
 ```
 
-The application stack needs `198.18.0.1` as a virtual IPv4 address (and `fd7a:115c:a1e0::1` for IPv6), must handle IP packets from the session's TUN, and must serve DNS on UDP/TCP port 53. The session has `198.18.0.2/30` and optionally `fd7a:115c:a1e0::2/64`. Local loopback (`127.0.0.1` and `::1`) intentionally remains inside the session namespace.
+The application stack needs `172.31.254.1` as a virtual IPv4 address (and `fd42:7d2a:9b31::1` for IPv6), must handle IP packets from the session's TUN, and must serve DNS on UDP/TCP port 53. The session has `172.31.254.2/30` and optionally `fd42:7d2a:9b31::2/64`. Local loopback (`127.0.0.1` and `::1`) intentionally remains inside the session namespace.
 
 The SSH server, authentication, PTYs, user identity, routing rules and all outbound connections belong to the integrating application. In Yuhaiin, the intended target is the existing lightweight network stack and inbound handlers.
 
