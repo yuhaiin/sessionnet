@@ -19,7 +19,7 @@ import (
 
 // configureNetwork uses namespace-bound netlink sockets. It never changes the
 // calling goroutine's network namespace or the host's routing table.
-func configureNetwork(ctx context.Context, pid int, name string, mtu int, ipv6 bool) error {
+func configureNetwork(ctx context.Context, pid int, name string, mtu int, ipv6 bool, addresses AddressConfig) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -61,7 +61,7 @@ func configureNetwork(ctx context.Context, pid int, name string, mtu int, ipv6 b
 	if err := h.LinkSetMTU(link, mtu); err != nil {
 		return fmt.Errorf("set TUN MTU: %w", err)
 	}
-	addr, err := netlink.ParseAddr(SessionIPv4)
+	addr, err := netlink.ParseAddr(addresses.SessionIPv4.String())
 	if err != nil {
 		return err
 	}
@@ -69,7 +69,7 @@ func configureNetwork(ctx context.Context, pid int, name string, mtu int, ipv6 b
 		return fmt.Errorf("add IPv4 address: %w", err)
 	}
 	if ipv6 {
-		addr6, err := netlink.ParseAddr(SessionIPv6)
+		addr6, err := netlink.ParseAddr(addresses.SessionIPv6.String())
 		if err != nil {
 			return err
 		}
@@ -96,14 +96,14 @@ func configureNetwork(ctx context.Context, pid int, name string, mtu int, ipv6 b
 
 // configureResolver mounts a dedicated resolver into the child's private
 // mount namespace without changing the host's /etc/resolv.conf.
-func configureResolver(pid int) error {
+func configureResolver(pid int, gateway string) error {
 	dir, err := os.MkdirTemp("", "sessionnet-resolv-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "resolv.conf")
-	if err := os.WriteFile(path, []byte("nameserver "+GatewayIPv4+"\noptions timeout:2 attempts:2\n"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte("nameserver "+gateway+"\noptions timeout:2 attempts:2\n"), 0644); err != nil {
 		return err
 	}
 	return mountResolverInNamespace(pid, path)

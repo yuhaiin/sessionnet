@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -194,8 +195,8 @@ func TestLinuxTunPacketHandoff(t *testing.T) {
 // isolated command's exact UDP payload reaches the supervisor's TUN FD.
 func matchesUDPProbe(packet []byte) bool {
 	if len(packet) < 28 || packet[0]>>4 != 4 || packet[9] != 17 ||
-		!bytes.Equal(packet[12:16], []byte{198, 18, 0, 2}) ||
-		!bytes.Equal(packet[16:20], []byte{198, 18, 0, 1}) {
+		!bytes.Equal(packet[12:16], []byte{172, 31, 254, 2}) ||
+		!bytes.Equal(packet[16:20], []byte{172, 31, 254, 1}) {
 		return false
 	}
 	ipHeaderLength := int(packet[0]&0x0f) * 4
@@ -234,5 +235,49 @@ func TestMatchesUDPProbe(t *testing.T) {
 	otherDestination[19] = 3
 	if matchesUDPProbe(otherDestination) {
 		t.Fatal("unrelated destination must be ignored")
+	}
+}
+
+func TestAddressConfig(t *testing.T) {
+	defaults, err := (AddressConfig{}).Resolve(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.GatewayIPv4.String() != GatewayIPv4 || defaults.GatewayIPv6.String() != GatewayIPv6 {
+		t.Fatalf("unexpected defaults: %+v", defaults)
+	}
+	if netip.MustParsePrefix("198.18.0.0/15").Overlaps(defaults.SessionIPv4.Masked()) ||
+		netip.MustParsePrefix("2001:2::/48").Overlaps(defaults.SessionIPv6.Masked()) ||
+		netip.MustParsePrefix("fd7a:115c:a1e0::/48").Overlaps(defaults.SessionIPv6.Masked()) {
+		t.Fatal("session defaults must not overlap Yuhaiin FakeIP or Tailscale ranges")
+	}
+	custom := AddressConfig{
+		GatewayIPv4: netip.MustParseAddr("10.250.250.1"),
+		SessionIPv4: netip.MustParsePrefix("10.250.250.2/30"),
+		GatewayIPv6: netip.MustParseAddr("fd22:3456:789a::1"),
+		SessionIPv6: netip.MustParsePrefix("fd22:3456:789a::2/64"),
+	}
+	actual, err := custom.Resolve(true)
+	if err != nil || actual != custom {
+		t.Fatalf("custom addresses: %+v, %v", actual, err)
+	}
+	cases := []struct {
+		name string
+		config AddressConfig
+		ipv6 bool
+	}{
+		{"partial IPv4", AddressConfig{GatewayIPv4: custom.GatewayIPv4}, false},
+		{"outside subnet", AddressConfig{GatewayIPv4: netip.MustParseAddr("10.250.250.5"), SessionIPv4: custom.SessionIPv4}, false},
+		{"same endpoint", AddressConfig{GatewayIPv4: custom.SessionIPv4.Addr(), SessionIPv4: custom.SessionIPv4}, false},
+		{"network address", AddressConfig{GatewayIPv4: netip.MustParseAddr("10.250.250.0"), SessionIPv4: custom.SessionIPv4}, false},
+		{"IPv6 disabled", AddressConfig{GatewayIPv6: custom.GatewayIPv6, SessionIPv6: custom.SessionIPv6}, false},
+		{"invalid v6", AddressConfig{GatewayIPv6: netip.MustParseAddr("fd22:3456:789a::3"), SessionIPv6: netip.MustParsePrefix("fd22:3456:789b::2/64")}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.config.Resolve(tc.ipv6); err == nil {
+				t.Fatal("expected address validation failure")
+			}
+		})
 	}
 }

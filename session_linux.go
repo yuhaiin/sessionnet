@@ -71,6 +71,10 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	if err := validate(cfg); err != nil {
 		return nil, err
 	}
+	addresses, err := cfg.Addresses.Resolve(cfg.IPv6)
+	if err != nil {
+		return nil, err
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -138,10 +142,10 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	if mtu == 0 {
 		mtu = DefaultMTU
 	}
-	if err = configureNetwork(ctx, cmd.Process.Pid, name, mtu, cfg.IPv6); err != nil {
+	if err = configureNetwork(ctx, cmd.Process.Pid, name, mtu, cfg.IPv6, addresses); err != nil {
 		return nil, fmt.Errorf("sessionnet: configure isolated network: %w", err)
 	}
-	if err = configureResolver(cmd.Process.Pid); err != nil {
+	if err = configureResolver(cmd.Process.Pid, addresses.GatewayIPv4.String()); err != nil {
 		return nil, fmt.Errorf("sessionnet: configure isolated resolver: %w", err)
 	}
 	s.stopContext = context.AfterFunc(ctx, func() { _ = s.Close() })
