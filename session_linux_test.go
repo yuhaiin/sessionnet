@@ -5,6 +5,7 @@ package sessionnet
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"strings"
@@ -156,32 +157,82 @@ func TestLinuxTunPacketHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer fd.Close()
-	type response struct {
-		packet []byte
-		err    error
-	}
-	packets := make(chan response, 1)
+	// The kernel may emit unrelated packets, such as IPv6 neighbor
+	// discovery traffic, immediately after the interface comes up.
+	result := make(chan error, 1)
 	go func() {
-		buf := make([]byte, 1500)
-		n, err := fd.Read(buf)
-		packets <- response{packet: buf[:n], err: err}
+		packet := make([]byte, 65535)
+		for {
+			n, err := fd.Read(packet)
+			if err != nil {
+				result <- err
+				return
+			}
+			if matchesUDPProbe(packet[:n]) {
+				result <- nil
+				return
+			}
+		}
 	}()
 	if err := s.Release(); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case result := <-packets:
-		if result.err != nil {
-			t.Fatal(result.err)
-		}
-		pkt := result.packet
-		if len(pkt) < 28 || pkt[0]>>4 != 4 || pkt[9] != 17 || !bytes.Equal(pkt[16:20], []byte{198, 18, 0, 1}) {
-			t.Fatalf("unexpected IPv4 UDP packet: %x", pkt)
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("no IP packet arrived on TUN")
+		t.Fatal("timed out waiting for the expected IPv4 UDP probe on TUN")
 	}
 	if err := s.Wait(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// matchesUDPProbe rejects unrelated interface traffic and checks that the
+// isolated command's exact UDP payload reaches the supervisor's TUN FD.
+func matchesUDPProbe(packet []byte) bool {
+	if len(packet) < 28 || packet[0]>>4 != 4 || packet[9] != 17 ||
+		!bytes.Equal(packet[12:16], []byte{198, 18, 0, 2}) ||
+		!bytes.Equal(packet[16:20], []byte{198, 18, 0, 1}) {
+		return false
+	}
+	ipHeaderLength := int(packet[0]&0x0f) * 4
+	if ipHeaderLength < 20 || len(packet) < ipHeaderLength+8 {
+		return false
+	}
+	udp := packet[ipHeaderLength:]
+	udpLength := int(binary.BigEndian.Uint16(udp[4:6]))
+	if udpLength != 8+len("probe") || len(udp) < udpLength {
+		return false
+	}
+	return binary.BigEndian.Uint16(udp[2:4]) == 5353 &&
+		bytes.Equal(udp[8:udpLength], []byte("probe"))
+}
+
+func TestMatchesUDPProbe(t *testing.T) {
+	probe := make([]byte, 20+8+len("probe"))
+	probe[0] = 0x45
+	probe[9] = 17
+	copy(probe[12:16], []byte{198, 18, 0, 2})
+	copy(probe[16:20], []byte{198, 18, 0, 1})
+	binary.BigEndian.PutUint16(probe[22:24], 5353)
+	binary.BigEndian.PutUint16(probe[24:26], uint16(8+len("probe")))
+	copy(probe[28:], "probe")
+	if !matchesUDPProbe(probe) {
+		t.Fatal("expected UDP probe was not recognized")
+	}
+	ipv6NeighborDiscovery := []byte{0x60, 0, 0, 0, 0, 8, 0x3a, 0xff}
+	if matchesUDPProbe(ipv6NeighborDiscovery) {
+		t.Fatal("IPv6 neighbor discovery packet must be ignored")
+	}
+	if matchesUDPProbe(probe[:24]) {
+		t.Fatal("truncated UDP probe must be ignored")
+	}
+	otherDestination := append([]byte(nil), probe...)
+	otherDestination[19] = 3
+	if matchesUDPProbe(otherDestination) {
+		t.Fatal("unrelated destination must be ignored")
 	}
 }
