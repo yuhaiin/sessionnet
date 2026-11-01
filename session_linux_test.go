@@ -216,8 +216,8 @@ func TestMatchesUDPProbe(t *testing.T) {
 	probe := make([]byte, 20+8+len("probe"))
 	probe[0] = 0x45
 	probe[9] = 17
-	copy(probe[12:16], []byte{198, 18, 0, 2})
-	copy(probe[16:20], []byte{198, 18, 0, 1})
+	copy(probe[12:16], []byte{172, 31, 254, 2})
+	copy(probe[16:20], []byte{172, 31, 254, 1})
 	binary.BigEndian.PutUint16(probe[22:24], 5353)
 	binary.BigEndian.PutUint16(probe[24:26], uint16(8+len("probe")))
 	copy(probe[28:], "probe")
