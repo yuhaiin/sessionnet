@@ -47,4 +47,4 @@ jobs:
       - name: Run privileged namespace tests
         run: |
           go test -c -o /tmp/sessionnet-integration.test .
-          sudo SESSIONNET_INTEGRATION=1 /tmp/sessionnet-integration.test -test.v -test.run 'TestLinux(SessionIntegration|StartGate)$'
+          sudo SESSIONNET_INTEGRATION=1 /tmp/sessionnet-integration.test -test.v -test.run 'TestLinux(SessionIntegration|StartGate|TunPacketHandoff)$'
