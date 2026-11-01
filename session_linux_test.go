@@ -7,8 +7,8 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"os"
 	"net/netip"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -262,9 +262,9 @@ func TestAddressConfig(t *testing.T) {
 		t.Fatalf("custom addresses: %+v, %v", actual, err)
 	}
 	cases := []struct {
-		name string
+		name   string
 		config AddressConfig
-		ipv6 bool
+		ipv6   bool
 	}{
 		{"partial IPv4", AddressConfig{GatewayIPv4: custom.GatewayIPv4}, false},
 		{"outside subnet", AddressConfig{GatewayIPv4: netip.MustParseAddr("10.250.250.5"), SessionIPv4: custom.SessionIPv4}, false},
