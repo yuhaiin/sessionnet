@@ -318,15 +318,19 @@ func TestLinuxSharedNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 	var first, second strings.Builder
+	processes := make([]*Process, 0, 2)
 	for i, output := range []*strings.Builder{&first, &second} {
 		p, err := owner.Spawn(ctx, Config{
-			Command:    []string{"/bin/sh", "-c", "readlink /proc/self/ns/net; readlink /proc/self/ns/mnt; cat /etc/resolv.conf"},
+			Command:    []string{"/bin/sh", "-c", "readlink /proc/self/ns/net; readlink /proc/self/ns/mnt; cat /etc/resolv.conf; sleep 0.2"},
 			Credential: unprivileged(), Stdout: output,
 		})
 		if err != nil {
 			t.Fatalf("spawn %d: %v", i, err)
 		}
 		defer p.Close()
+		processes = append(processes, p)
+	}
+	for i, p := range processes {
 		if err := p.Wait(); err != nil {
 			t.Fatalf("wait %d: %v", i, err)
 		}
