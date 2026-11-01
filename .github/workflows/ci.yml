@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Unit and race tests
+        run: go test -race -count=1 ./...
+      - name: Cross-platform builds
+        run: |
+          GOOS=linux GOARCH=arm64 go build ./...
+          GOOS=darwin GOARCH=arm64 go build ./...
+          GOOS=windows GOARCH=amd64 go build ./...
+
+  linux-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install networking tools
+        run: sudo apt-get update && sudo apt-get install -y iproute2 util-linux
+      - name: Verify TUN availability
+        run: |
+          if [ ! -c /dev/net/tun ]; then sudo modprobe tun; fi
+          test -c /dev/net/tun
+      - name: Run privileged namespace tests
+        run: |
+          go test -c -o /tmp/sessionnet-integration.test .
+          sudo SESSIONNET_INTEGRATION=1 /tmp/sessionnet-integration.test -test.v -test.run 'TestLinux(SessionIntegration|StartGate|TunPacketHandoff)$'
