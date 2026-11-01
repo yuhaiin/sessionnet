@@ -4,10 +4,10 @@ package sessionnet
 
 import (
 	"bytes"
-	"fmt"
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"strings"
