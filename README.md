@@ -4,7 +4,7 @@
 
 `sessionnet` is a small Go module that starts Linux processes in an isolated network namespace and exposes their TUN packet stream to a supervising application. It is intended for integrations such as an SSH server whose shell commands must use an application-controlled routing and policy engine.
 
-**Status:** experimental Linux backend. The package is not an SSH server, is not a security sandbox, and has not been validated on a privileged integration runner yet.
+**Status:** experimental Linux backend. The package is not an SSH server or a security sandbox.
 
 ## How it works
 
@@ -72,7 +72,7 @@ The SSH server, authentication, PTYs, user identity, routing rules and all outbo
 - Namespace-local routes alone do not stop a sufficiently privileged guest from changing its own network configuration; the command should always run without effective networking capabilities.
 - Do not use application packet handling or resolver failures as a reason to dial directly from the isolated process. The integrating application must fail closed and close the session when its packet stack stops.
 - This initial implementation uses command-line `ip`, `nsenter` and `mount`. It needs controlled executable paths and a trustworthy host installation.
-- It has not yet been tested with a production SSH implementation or a privileged Linux integration runner.
+- It has not yet been tested with a production SSH implementation.
 
 ## Testing
 
@@ -85,4 +85,4 @@ go vet ./...
 SESSIONNET_INTEGRATION=1 go test -run TestLinuxSessionIntegration -v ./...
 ```
 
-Ordinary unit tests require no capabilities. CI runs formatting, unit tests, race detection, vetting and cross-platform builds. Privileged integration tests are opt-in and should be run on a suitably isolated test host, not a shared development machine.
+Ordinary unit tests require no capabilities. CI runs formatting, unit tests, race detection, vetting, cross-platform builds, and privileged Linux namespace tests on an ephemeral GitHub-hosted runner. Locally, privileged tests are opt-in and should run only on an isolated test host.
