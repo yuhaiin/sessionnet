@@ -149,7 +149,9 @@ func (s *Session) Spawn(ctx context.Context, config Config) (*Process, error) {
 		p.mu.Unlock()
 		close(p.done)
 	}()
+	p.mu.Lock()
 	p.stop = context.AfterFunc(ctx, func() { _ = p.Close() })
+	p.mu.Unlock()
 	return p, nil
 }
 
@@ -177,8 +179,11 @@ func (p *Process) Close() error {
 			_ = p.cmd.Process.Kill()
 		}
 		<-p.done
-		if p.stop != nil {
-			p.stop()
+		p.mu.Lock()
+		stop := p.stop
+		p.mu.Unlock()
+		if stop != nil {
+			stop()
 		}
 	})
 	return nil
