@@ -20,6 +20,15 @@ jobs:
           cache: false
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
+      - name: Resolve module checksums
+        run: |
+          go mod tidy
+          echo "BEGIN_GO_MOD"
+          cat go.mod
+          echo "END_GO_MOD"
+          echo "BEGIN_GO_SUM"
+          cat go.sum
+          echo "END_GO_SUM"
       - name: Vet
         run: go vet ./...
       - name: Unit and race tests
