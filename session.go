@@ -6,8 +6,8 @@ package sessionnet
 
 import (
 	"errors"
-	"io"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
 )
@@ -119,7 +119,7 @@ type Config struct {
 	Stderr     io.Writer
 	// PTYSlave, when non-nil, becomes the controlling terminal. Ownership
 	// stays with the caller, which is responsible for PTY allocation.
-	PTYSlave *os.File
+	PTYSlave  *os.File
 	MTU       int
 	IPv6      bool
 	Addresses AddressConfig
