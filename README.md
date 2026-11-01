@@ -20,11 +20,10 @@ There is no NAT, built-in DNS server, or Internet access in this module. **The s
 ## Requirements
 
 - Linux with `/dev/net/tun`, `CAP_SYS_ADMIN`, and `CAP_NET_ADMIN` for the supervising process.
-- `ip` from iproute2 and `nsenter`/`mount` from util-linux.
 - A valid **non-root** UID/GID to run the command. The supplied supplementary groups replace inherited groups.
 - A packet stack that reads/writes raw L3 packets from the TUN FD and applies the application's routing policy.
 
-No CGO and no external Go module dependencies. The package exposes API stubs that return `ErrUnsupported` on other operating systems.
+No CGO and no system networking CLI dependencies. Linux network setup uses `vishvananda/netlink`, `vishvananda/netns`, and `golang.org/x/sys/unix`. The package exposes API stubs that return `ErrUnsupported` on other operating systems.
 
 ## Example
 
@@ -71,7 +70,7 @@ The SSH server, authentication, PTYs, user identity, routing rules and all outbo
 - Process-group cleanup handles normal descendants but does **not** contain children that daemonize into new process groups/sessions. Strict containment requires cgroup v2, including recovery after supervisor crashes.
 - Namespace-local routes alone do not stop a sufficiently privileged guest from changing its own network configuration; the command should always run without effective networking capabilities.
 - Do not use application packet handling or resolver failures as a reason to dial directly from the isolated process. The integrating application must fail closed and close the session when its packet stack stops.
-- This initial implementation uses command-line `ip`, `nsenter` and `mount`. It needs controlled executable paths and a trustworthy host installation.
+- Network configuration uses namespace-scoped Netlink handles. The resolver bind mount uses `setns`, `unshare(CLONE_FS)`, and `mount` syscalls on a locked OS thread. Namespace restoration is mandatory before returning the thread to Go.
 - It has not yet been tested with a production SSH implementation.
 
 ## Testing

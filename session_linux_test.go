@@ -65,7 +65,7 @@ func TestInterfaceName(t *testing.T) {
 }
 
 // Integration requires Linux with CAP_SYS_ADMIN, CAP_NET_ADMIN, /dev/net/tun,
-// iproute2, util-linux and mount permissions. CI without privileges skips.
+// and mount permissions. CI without privileges skips.
 func TestLinuxSessionIntegration(t *testing.T) {
 	if testing.Short() || os.Getenv("SESSIONNET_INTEGRATION") != "1" {
 		t.Skip("set SESSIONNET_INTEGRATION=1 on an appropriately privileged Linux host")
@@ -73,7 +73,7 @@ func TestLinuxSessionIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var out strings.Builder
-	s, err := Open(ctx, Config{Command: []string{"/bin/sh", "-c", "ip route; cat /etc/resolv.conf"}, Credential: unprivileged(), Stdout: &out})
+	s, err := Open(ctx, Config{Command: []string{"/bin/sh", "-c", "cat /proc/net/route; cat /etc/resolv.conf"}, Credential: unprivileged(), Stdout: &out})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestLinuxSessionIntegration(t *testing.T) {
 	if err := s.Wait(); err != nil && !errors.Is(err, os.ErrClosed) {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "default dev ") || !strings.Contains(out.String(), GatewayIPv4) {
+	if !strings.Contains(out.String(), "00000000") || !strings.Contains(out.String(), GatewayIPv4) {
 		t.Fatalf("bad isolated output: %q", out.String())
 	}
 }
