@@ -299,7 +299,7 @@ func TestLinuxSharedNamespace(t *testing.T) {
 	defer keepalive.Close()
 
 	owner, err := Open(ctx, Config{
-		Command: []string{"/bin/sh", "-c", "read -r done"},
+		Command:    []string{"/bin/sh", "-c", "read -r done"},
 		Credential: unprivileged(), Stdin: stdin,
 	})
 	if err != nil {
@@ -320,7 +320,7 @@ func TestLinuxSharedNamespace(t *testing.T) {
 	var first, second strings.Builder
 	for i, output := range []*strings.Builder{&first, &second} {
 		p, err := owner.Spawn(ctx, Config{
-			Command: []string{"/bin/sh", "-c", "readlink /proc/self/ns/net; readlink /proc/self/ns/mnt; cat /etc/resolv.conf"},
+			Command:    []string{"/bin/sh", "-c", "readlink /proc/self/ns/net; readlink /proc/self/ns/mnt; cat /etc/resolv.conf"},
 			Credential: unprivileged(), Stdout: output,
 		})
 		if err != nil {
