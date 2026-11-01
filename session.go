@@ -120,7 +120,7 @@ type Config struct {
 	// PTYSlave, when non-nil, becomes the controlling terminal. Ownership
 	// stays with the caller, which is responsible for PTY allocation.
 	PTYSlave *os.File
-	MTU      int
-	IPv6     bool
+	MTU       int
+	IPv6      bool
 	Addresses AddressConfig
 }
