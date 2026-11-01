@@ -20,7 +20,7 @@ jobs:
           cache: false
       - name: Check formatting
         run: |
-          gofmt -l .
+          gofmt -d session.go session_linux_test.go
           test -z "$(gofmt -l .)"
       - name: Verify module files
         run: |
