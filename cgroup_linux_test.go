@@ -29,7 +29,7 @@ func TestCgroupRootValidation(t *testing.T) {
 
 func TestSafeGroupName(t *testing.T) {
 	for _, tc := range []struct {
-		name string
+		name  string
 		valid bool
 	}{
 		{"session-0123456789abcdef0123456789abcdef", true},
