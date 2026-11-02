@@ -68,6 +68,13 @@ func NewCgroupManager(root string) (_ *CgroupManager, err error) {
 	if stat.Type != unix.CGROUP2_SUPER_MAGIC {
 		return nil, errors.New("sessionnet: cgroup root must be on a cgroup v2 filesystem")
 	}
+	var parentStat unix.Statfs_t
+	if err = unix.Statfs(filepath.Dir(root), &parentStat); err != nil {
+		return nil, err
+	}
+	if parentStat.Type != unix.CGROUP2_SUPER_MAGIC {
+		return nil, errors.New("sessionnet: cgroup root must be a dedicated subtree, not the cgroup mount point")
+	}
 	if err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("sessionnet: cgroup root is locked by another supervisor: %w", err)
 	}
