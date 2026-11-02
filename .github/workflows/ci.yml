@@ -20,7 +20,6 @@ jobs:
           cache: false
       - name: Check formatting
         run: |
-          gofmt -d cgroup_linux.go cgroup_linux_test.go session.go session_linux.go spawn_linux.go cgroup_other.go
           test -z "$(gofmt -l .)"
       - name: Verify module files
         run: |
@@ -52,13 +51,6 @@ jobs:
         run: |
           go test -c -o /tmp/sessionnet-integration.test .
           sudo SESSIONNET_INTEGRATION=1 /tmp/sessionnet-integration.test -test.v -test.run 'TestLinux(SessionIntegration|StartGate|TunPacketHandoff|SharedNamespace)
-      - name: Verify cgroup v2 containment and crash recovery
-        run: |
-          test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs
-          sudo mkdir -p /sys/fs/cgroup/sessionnet-test
-          sudo SESSIONNET_CGROUP_TEST_ROOT=/sys/fs/cgroup/sessionnet-test /tmp/sessionnet-integration.test -test.v -test.run 'TestLinuxCgroup'
-          sudo rmdir /sys/fs/cgroup/sessionnet-test
-
 
       - name: Verify cgroup v2 containment and crash recovery
         run: |
@@ -66,3 +58,4 @@ jobs:
           sudo mkdir -p /sys/fs/cgroup/sessionnet-test
           sudo SESSIONNET_CGROUP_TEST_ROOT=/sys/fs/cgroup/sessionnet-test /tmp/sessionnet-integration.test -test.v -test.run 'TestLinuxCgroup'
           sudo rmdir /sys/fs/cgroup/sessionnet-test
+
