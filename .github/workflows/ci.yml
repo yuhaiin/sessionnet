@@ -20,6 +20,7 @@ jobs:
           cache: false
       - name: Check formatting
         run: |
+          gofmt -d cgroup_linux.go cgroup_linux_test.go session.go session_linux.go spawn_linux.go cgroup_other.go
           test -z "$(gofmt -l .)"
       - name: Verify module files
         run: |
