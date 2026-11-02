@@ -115,6 +115,27 @@ The SSH server, authentication, PTYs, user identity, routing rules and all outbo
 
 ## Limitations and security boundaries
 
+Local launchers can set `Config.IsolateDNS` to replace the private NSS
+`hosts` database with `files dns` and hide conventional nscd runtime directories.
+This keeps libc lookups from delegating to the host's `nss-resolve` or nscd
+services. Other NSS databases remain unchanged. An existing
+`/etc/nsswitch.conf` mount target is required. This is resolver isolation,
+not a restriction on arbitrary host Unix sockets or custom resolver services.
+
+`Session.Signal` forwards an operating-system signal to the session command
+using `os.Process.Signal`, including protection against signaling a recycled
+PID after `Wait`. Terminal job-control signals should use the controlling PTY.
+
+Measure resolver preparation and namespace lifecycle costs with:
+
+```sh
+go test -run '^$' -bench '^BenchmarkIsolatedNSS$' -benchmem -count=3
+SESSIONNET_INTEGRATION=1 go test -run '^$' -bench '^BenchmarkLinuxSessionLifecycle$' -benchmem -count=3
+```
+
+The lifecycle benchmark needs namespace/TUN privileges and excludes packet
+processing and Internet traffic.
+
 - **This is network isolation, not a general-purpose sandbox.** It does not isolate the host filesystem, processes, Unix-domain sockets, inherited descriptors, or setuid programs. Do not expose untrusted SSH users without separate filesystem/privilege isolation and a narrowly scoped privileged helper.
 - The supervisor requires broad Linux capabilities. A production deployment should move privileged setup into an audited helper and drop privileges before accepting user input.
 - Process-group cleanup is only best-effort without `Config.Cgroup`; for SSH or long-lived sessions, require `CgroupManager` to kill all descendants and recover orphaned groups at startup.

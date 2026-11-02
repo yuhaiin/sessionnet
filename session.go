@@ -123,6 +123,10 @@ type Config struct {
 	MTU       int
 	IPv6      bool
 	Addresses AddressConfig
+	// IsolateDNS forces libc hostname lookups through the session resolver.
+	// It replaces only the hosts entry in a private nsswitch.conf and masks
+	// known host nscd socket directories. Other NSS databases are preserved.
+	IsolateDNS bool
 	// Cgroup places this session and all commands spawned from it in a
 	// managed cgroup v2. When unset, process-group cleanup is best-effort.
 	Cgroup *CgroupManager

@@ -163,7 +163,7 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	if err = configureNetwork(ctx, cmd.Process.Pid, name, mtu, cfg.IPv6, addresses); err != nil {
 		return nil, fmt.Errorf("sessionnet: configure isolated network: %w", err)
 	}
-	if err = configureResolver(cmd.Process.Pid, addresses.GatewayIPv4.String()); err != nil {
+	if err = configureResolver(cmd.Process.Pid, addresses.GatewayIPv4.String(), cfg.IsolateDNS); err != nil {
 		return nil, fmt.Errorf("sessionnet: configure isolated resolver: %w", err)
 	}
 	s.stopContext = context.AfterFunc(ctx, func() { _ = s.Close() })
@@ -197,6 +197,11 @@ func (s *Session) DupTun() (*os.File, error) {
 // Interface returns the isolated kernel TUN interface name.
 func (s *Session) Interface() string { return s.name }
 func (s *Session) PID() int          { return s.cmd.Process.Pid }
+
+// Signal forwards a signal to the session command. os.Process synchronizes
+// signaling with Wait so an already-reaped PID cannot target a new process.
+// For terminal-generated job-control signals, use the controlling PTY instead.
+func (s *Session) Signal(signal os.Signal) error { return s.cmd.Process.Signal(signal) }
 
 // Release starts the isolated command after the caller's packet stack is ready.
 func (s *Session) Release() error {

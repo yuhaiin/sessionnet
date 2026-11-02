@@ -15,6 +15,7 @@ func Open(context.Context, Config) (*Session, error) { return nil, ErrUnsupporte
 func (*Session) DupTun() (*os.File, error)           { return nil, ErrUnsupported }
 func (*Session) Interface() string                   { return "" }
 func (*Session) PID() int                            { return 0 }
+func (*Session) Signal(os.Signal) error              { return ErrUnsupported }
 func (*Session) Release() error                      { return ErrUnsupported }
 func (*Session) Done() <-chan struct{}               { return nil }
 func (*Session) Wait() error                         { return ErrUnsupported }
