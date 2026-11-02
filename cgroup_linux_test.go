@@ -89,11 +89,11 @@ func TestLinuxCgroupProcessContainment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer child.Close()
-	entries, err := os.ReadDir(root)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("expected one session cgroup: %v %v", entries, err)
+	names, err := managedGroupNames(root)
+	if err != nil || len(names) != 1 {
+		t.Fatalf("expected one session cgroup: %v %v", names, err)
 	}
-	processes, err := os.ReadFile(filepath.Join(root, entries[0].Name(), "cgroup.procs"))
+	processes, err := os.ReadFile(filepath.Join(root, names[0], "cgroup.procs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,9 +115,9 @@ func TestLinuxCgroupProcessContainment(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("cgroup.kill did not stop the spawned process")
 	}
-	entries, err = os.ReadDir(root)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("session cgroup was not removed: %v %v", entries, err)
+	names, err = managedGroupNames(root)
+	if err != nil || len(names) != 0 {
+		t.Fatalf("session cgroup was not removed: %v %v", names, err)
 	}
 }
 
@@ -161,9 +161,9 @@ func TestLinuxCgroupOrphanRecovery(t *testing.T) {
 		_ = cmd.Process.Kill()
 		t.Fatal("orphan was not terminated during recovery")
 	}
-	entries, err := os.ReadDir(root)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("orphan cgroup remains: %v %v", entries, err)
+	names, err := managedGroupNames(root)
+	if err != nil || len(names) != 0 {
+		t.Fatalf("orphan cgroup remains: %v %v", names, err)
 	}
 }
 
@@ -182,4 +182,18 @@ func TestLinuxCgroupManagerExclusiveLock(t *testing.T) {
 	if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
 		t.Fatalf("unexpected exclusive lock error: %v", err)
 	}
+}
+
+func managedGroupNames(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() && safeGroupName(entry.Name()) {
+			names = append(names, entry.Name())
+		}
+	}
+	return names, nil
 }
