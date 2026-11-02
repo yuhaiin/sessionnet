@@ -179,7 +179,7 @@ func cgroupPopulated(group *os.File) (bool, error) {
 	if err := errors.Join(readErr, closeErr); err != nil {
 		return false, err
 	}
-	for line := range strings.SplitSeq(string(content), "\n") {
+	for _, line := range strings.Split(string(content), "\n") {
 		if line == "populated 1" {
 			return true, nil
 		}
