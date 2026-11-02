@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/vishvananda/netlink"
@@ -96,7 +97,7 @@ func configureNetwork(ctx context.Context, pid int, name string, mtu int, ipv6 b
 
 // configureResolver mounts a dedicated resolver into the child's private
 // mount namespace without changing the host's /etc/resolv.conf.
-func configureResolver(pid int, gateway string) error {
+func configureResolver(pid int, gateway string, isolateDNS bool) error {
 	dir, err := os.MkdirTemp("", "sessionnet-resolv-")
 	if err != nil {
 		return err
@@ -106,14 +107,39 @@ func configureResolver(pid int, gateway string) error {
 	if err := os.WriteFile(path, []byte("nameserver "+gateway+"\noptions timeout:2 attempts:2\n"), 0644); err != nil {
 		return err
 	}
-	return mountResolverInNamespace(pid, path)
+	if isolateDNS {
+		original, err := os.ReadFile("/etc/nsswitch.conf")
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, "nsswitch.conf"), []byte(isolatedNSS(string(original))), 0644); err != nil {
+			return err
+		}
+	}
+	return mountResolverInNamespace(pid, path, isolateDNS)
+}
+
+func isolatedNSS(original string) string {
+	var result strings.Builder
+	for _, line := range strings.Split(original, "\n") {
+		key, _, found := strings.Cut(line, ":")
+		if found && strings.TrimSpace(key) == "hosts" {
+			continue
+		}
+		if line != "" {
+			result.WriteString(line)
+			result.WriteByte('\n')
+		}
+	}
+	result.WriteString("hosts: files dns\n")
+	return result.String()
 }
 
 // mountResolverInNamespace isolates CLONE_FS on a single locked OS thread
 // before setns(CLONE_NEWNS). A dedicated goroutine is used so a failed restore
 // can terminate the contaminated OS thread without returning it to the pool.
 // Do not add Go work to this thread after a failed restoration.
-func mountResolverInNamespace(pid int, source string) error {
+func mountResolverInNamespace(pid int, source string, isolateDNS bool) error {
 	target, err := os.Open(fmt.Sprintf("/proc/%d/ns/mnt", pid))
 	if err != nil {
 		return err
@@ -142,6 +168,29 @@ func mountResolverInNamespace(pid int, source string) error {
 		mountErr := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, "")
 		if mountErr == nil {
 			mountErr = unix.Mount(source, "/etc/resolv.conf", "", unix.MS_BIND, "")
+		}
+		if mountErr == nil && isolateDNS {
+			mountErr = unix.Mount(filepath.Join(filepath.Dir(source), "nsswitch.conf"), "/etc/nsswitch.conf", "", unix.MS_BIND, "")
+			// glibc can consult nscd before invoking any hosts NSS module.
+			// Mask only its runtime directory in this private mount namespace.
+			seen := make(map[string]bool)
+			for _, path := range []string{"/run/nscd", "/var/run/nscd"} {
+				if mountErr != nil {
+					break
+				}
+				target, err := filepath.EvalSymlinks(path)
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				if err != nil {
+					mountErr = err
+					break
+				}
+				if !seen[target] {
+					seen[target] = true
+					mountErr = unix.Mount("tmpfs", target, "tmpfs", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "size=4096,mode=0755")
+				}
+			}
 		}
 		restoreErr := unix.Setns(int(original.Fd()), unix.CLONE_NEWNS)
 		if restoreErr != nil {
