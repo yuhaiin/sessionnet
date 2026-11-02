@@ -31,6 +31,42 @@ validates the network endpoints. **The embedding application must additionally
 check these links for overlap with its active FakeIP or VPN routes**; no
 hardcoded private subnet can guarantee avoiding every deployment-specific route.
 
+## Strict process containment (cgroup v2)
+
+For SSH access, create one `CgroupManager` per listening SSH inbound:
+
+```go
+manager, err := sessionnet.NewCgroupManager("/sys/fs/cgroup/yuhaiin/ssh/<stable-inbound-id>")
+if err != nil { return err }
+defer manager.Close()
+
+session, err := sessionnet.Open(ctx, sessionnet.Config{
+    Command: []string{"/bin/sh", "-l"},
+    Credential: &sessionnet.Credential{UID: 65534, GID: 65534},
+    Cgroup: manager,
+})
+```
+
+The manager holds an exclusive lock on this stable cgroup v2 root, kills
+`session-*` cgroups left by the previous supervisor before accepting traffic,
+and fails closed if cleanup or locking is unavailable. The kernel atomically
+places the namespace owner and every `Session.Spawn` child in the same
+cgroup via `CLONE_INTO_CGROUP`. On shutdown `cgroup.kill` kills the full
+process tree, including detached process groups. No PID enumeration is used.
+
+The root MUST be a writable cgroup v2 directory delegated to the supervisor;
+not a normal data directory. Linux kernel 5.14+ with `cgroup.kill` and
+`clone3(CLONE_INTO_CGROUP)` support is required. The library never falls
+back to a racy post-start PID migration. Use one distinct, stable root per
+SSH inbound, and do not grant guest users write access to the cgroup tree.
+A running supervisor holds a root lock to prevent a second instance from
+reaping live sessions. The lock is automatically released if the process dies.
+
+With `Config.Cgroup == nil`, existing standalone callers retain the earlier
+best-effort process-group cleanup. SSH integrations SHOULD require a manager
+and refuse to enable the listener if the cgroup root cannot be prepared.
+Cgroup isolation does not isolate host filesystems or Unix sockets.
+
 ## Requirements
 
 - Linux with `/dev/net/tun`, `CAP_SYS_ADMIN`, and `CAP_NET_ADMIN` for the supervising process.
@@ -81,7 +117,7 @@ The SSH server, authentication, PTYs, user identity, routing rules and all outbo
 
 - **This is network isolation, not a general-purpose sandbox.** It does not isolate the host filesystem, processes, Unix-domain sockets, inherited descriptors, or setuid programs. Do not expose untrusted SSH users without separate filesystem/privilege isolation and a narrowly scoped privileged helper.
 - The supervisor requires broad Linux capabilities. A production deployment should move privileged setup into an audited helper and drop privileges before accepting user input.
-- Process-group cleanup handles normal descendants but does **not** contain children that daemonize into new process groups/sessions. Strict containment requires cgroup v2, including recovery after supervisor crashes.
+- Process-group cleanup is only best-effort without `Config.Cgroup`; for SSH or long-lived sessions, require `CgroupManager` to kill all descendants and recover orphaned groups at startup.
 - Namespace-local routes alone do not stop a sufficiently privileged guest from changing its own network configuration; the command should always run without effective networking capabilities.
 - Do not use application packet handling or resolver failures as a reason to dial directly from the isolated process. The integrating application must fail closed and close the session when its packet stack stops.
 - Network configuration uses namespace-scoped Netlink handles. The resolver bind mount uses `setns`, `unshare(CLONE_FS)`, and `mount` syscalls on a locked OS thread. Namespace restoration is mandatory before returning the thread to Go.
@@ -96,6 +132,9 @@ go vet ./...
 
 # Requires a suitably privileged Linux VM or host.
 SESSIONNET_INTEGRATION=1 go test -run TestLinuxSessionIntegration -v ./...
+
+# Requires a writable, dedicated cgroup v2 parent on a test VM.
+SESSIONNET_CGROUP_TEST_ROOT=/sys/fs/cgroup/sessionnet-test go test -run 'TestLinuxCgroup' -v ./...
 ```
 
 Ordinary unit tests require no capabilities. CI runs formatting, unit tests, race detection, vetting, cross-platform builds, and privileged Linux namespace tests on an ephemeral GitHub-hosted runner. Locally, privileged tests are opt-in and should run only on an isolated test host.

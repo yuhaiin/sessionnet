@@ -40,6 +40,8 @@ type Session struct {
 	released    bool
 	closed      bool
 	closeOnce   sync.Once
+	cgroup      *sessionCgroup
+	closeErr    error
 }
 
 func validate(c Config) error {
@@ -77,6 +79,18 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	var group *sessionCgroup
+	if cfg.Cgroup != nil {
+		group, err = cfg.Cgroup.newGroup()
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if err != nil {
+				err = errors.Join(err, group.Close())
+			}
+		}()
 	}
 	name, err := randomInterfaceName()
 	if err != nil {
@@ -121,11 +135,15 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 		Setctty:    cfg.PTYSlave != nil,
 		Ctty:       0,
 	}
+	if group != nil {
+		cmd.SysProcAttr.UseCgroupFD = true
+		cmd.SysProcAttr.CgroupFD = int(group.fd.Fd())
+	}
 	if err = cmd.Start(); err != nil {
 		_ = w.Close()
 		return nil, fmt.Errorf("sessionnet: spawn isolated process: %w", err)
 	}
-	s := &Session{cmd: cmd, tun: tun, name: name, ready: w, done: make(chan struct{})}
+	s := &Session{cmd: cmd, tun: tun, name: name, ready: w, done: make(chan struct{}), cgroup: group}
 	go func() {
 		result := cmd.Wait()
 		s.mu.Lock()
@@ -203,16 +221,18 @@ func (s *Session) Wait() error {
 	return s.finished
 }
 
-// Close kills the session process group, closes its TUN, and waits for exit.
-// The caller must separately close its duplicated TUN FD and packet stack.
-// Daemonized children which deliberately escape the process group require an
-// enclosing cgroup; this package does not claim to provide a sandbox.
+// Close kills all processes in the managed cgroup, or falls back to the
+// process group if no cgroup was configured. It also closes its TUN and
+// waits for the namespace owner. Duplicated TUN descriptors remain caller-owned.
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		s.closed = true
 		_ = s.ready.Close()
 		s.mu.Unlock()
+		if s.cgroup != nil {
+			s.closeErr = errors.Join(s.closeErr, s.cgroup.Close())
+		}
 		select {
 		case <-s.done:
 		default:
@@ -220,12 +240,12 @@ func (s *Session) Close() error {
 			_ = s.cmd.Process.Kill()
 		}
 		<-s.done
-		_ = s.tun.Close()
+		s.closeErr = errors.Join(s.closeErr, s.tun.Close())
 		if s.stopContext != nil {
 			s.stopContext()
 		}
 	})
-	return nil
+	return s.closeErr
 }
 
 func randomInterfaceName() (string, error) {

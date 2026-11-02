@@ -123,4 +123,7 @@ type Config struct {
 	MTU       int
 	IPv6      bool
 	Addresses AddressConfig
+	// Cgroup places this session and all commands spawned from it in a
+	// managed cgroup v2. When unset, process-group cleanup is best-effort.
+	Cgroup *CgroupManager
 }

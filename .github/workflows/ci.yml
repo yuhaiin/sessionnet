@@ -51,3 +51,11 @@ jobs:
         run: |
           go test -c -o /tmp/sessionnet-integration.test .
           sudo SESSIONNET_INTEGRATION=1 /tmp/sessionnet-integration.test -test.v -test.run 'TestLinux(SessionIntegration|StartGate|TunPacketHandoff|SharedNamespace)$'
+
+      - name: Verify cgroup v2 containment and crash recovery
+        run: |
+          test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs
+          sudo mkdir -p /sys/fs/cgroup/sessionnet-test
+          sudo SESSIONNET_CGROUP_TEST_ROOT=/sys/fs/cgroup/sessionnet-test /tmp/sessionnet-integration.test -test.v -test.run 'TestLinuxCgroup'
+          sudo rmdir /sys/fs/cgroup/sessionnet-test
+

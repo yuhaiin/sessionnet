@@ -96,6 +96,10 @@ func (s *Session) Spawn(ctx context.Context, config Config) (*Process, error) {
 		Setctty: config.PTYSlave != nil,
 		Ctty:    0,
 	}
+	if s.cgroup != nil {
+		command.SysProcAttr.UseCgroupFD = true
+		command.SysProcAttr.CgroupFD = int(s.cgroup.fd.Fd())
+	}
 
 	type started struct{ err error }
 	result := make(chan started, 1)
