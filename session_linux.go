@@ -191,6 +191,13 @@ func (s *Session) DupTun() (*os.File, error) {
 		return nil, err
 	}
 	syscall.CloseOnExec(fd)
+	// os.NewFile enrolls a nonblocking descriptor in Go's poller. Without
+	// this, Close cannot interrupt a blocked TUN read and packet-stack
+	// shutdown can wait indefinitely for another incoming packet.
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		_ = syscall.Close(fd)
+		return nil, err
+	}
 	return os.NewFile(uintptr(fd), s.name+"-packets"), nil
 }
 

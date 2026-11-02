@@ -126,6 +126,9 @@ not a restriction on arbitrary host Unix sockets or custom resolver services.
 using `os.Process.Signal`, including protection against signaling a recycled
 PID after `Wait`. Terminal job-control signals should use the controlling PTY.
 
+Duplicated packet FDs are nonblocking and registered with Go's file poller,
+so closing the FD interrupts an idle read during packet-stack shutdown.
+
 Measure resolver preparation and namespace lifecycle costs with:
 
 ```sh
