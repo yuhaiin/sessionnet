@@ -270,3 +270,17 @@ func TestAddressConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestAppArmorUsernsMessageNamesExecutable(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	msg := appArmorUsernsMessage()
+	if !strings.Contains(msg, "apparmor_restrict_unprivileged_userns=1") || !strings.Contains(msg, "userns,") || !strings.Contains(msg, exe) {
+		t.Fatalf("AppArmor message lacks the remedy: %s", msg)
+	}
+}
