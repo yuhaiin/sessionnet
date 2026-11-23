@@ -4,6 +4,7 @@ package sessionnet
 
 import (
 	"context"
+	"os"
 )
 
 // Process is unsupported on non-Linux platforms.
@@ -13,4 +14,5 @@ func (*Session) Spawn(context.Context, Config) (*Process, error) { return nil, E
 func (*Process) PID() int                                        { return 0 }
 func (*Process) Done() <-chan struct{}                           { return nil }
 func (*Process) Wait() error                                     { return ErrUnsupported }
+func (*Process) Signal(os.Signal) error                          { return ErrUnsupported }
 func (*Process) Close() error                                    { return nil }

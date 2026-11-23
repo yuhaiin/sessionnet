@@ -19,6 +19,52 @@ import (
 
 const groupPrefix = "session-"
 
+// ErrNoDelegatedCgroup reports that the caller's cgroup was not delegated.
+var ErrNoDelegatedCgroup = errors.New("sessionnet: cgroup delegation is unavailable")
+
+// DelegatedCgroupRoot returns <own cgroup>/name when the caller's own cgroup
+// v2 directory was explicitly delegated to it and is writable. systemd marks
+// a unit started with Delegate=yes with the trusted.delegate (system
+// manager) or user.delegate (user manager) extended attribute. Without that
+// marker the hierarchy belongs to the service manager and is never modified;
+// callers should then rely on the PID namespace supervisor alone.
+func DelegatedCgroupRoot(name string) (string, error) {
+	if name == "" || strings.ContainsAny(name, "/\x00") || name == "." || name == ".." {
+		return "", errors.New("sessionnet: invalid cgroup name")
+	}
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return "", err
+	}
+	var own string
+	for _, line := range strings.Split(string(data), "\n") {
+		if path, ok := strings.CutPrefix(line, "0::"); ok {
+			own = path
+		}
+	}
+	if own == "" || !filepath.IsAbs(own) || own == "/" {
+		return "", fmt.Errorf("%w: not in a cgroup v2 subtree", ErrNoDelegatedCgroup)
+	}
+	dir := filepath.Join("/sys/fs/cgroup", own)
+	delegated := false
+	for _, attr := range []string{"trusted.delegate", "user.delegate"} {
+		value := make([]byte, 8)
+		if n, err := unix.Getxattr(dir, attr, value); err == nil && strings.TrimSpace(string(value[:n])) == "1" {
+			delegated = true
+		}
+	}
+	if !delegated {
+		return "", fmt.Errorf("%w: %s is not marked as delegated (start Yuhaiin with systemd Delegate=yes or set an explicit cgroup root)", ErrNoDelegatedCgroup, dir)
+	}
+	if err := unix.Access(dir, unix.W_OK|unix.X_OK); err != nil {
+		return "", fmt.Errorf("%w: %s is not writable: %v", ErrNoDelegatedCgroup, dir, err)
+	}
+	if err := unix.Access(filepath.Join(dir, "cgroup.procs"), unix.W_OK); err != nil {
+		return "", fmt.Errorf("%w: %s/cgroup.procs is not writable: %v", ErrNoDelegatedCgroup, dir, err)
+	}
+	return filepath.Join(dir, name), nil
+}
+
 // CgroupManager owns a private cgroup v2 subtree and an exclusive lifetime
 // lock. It reaps leftover session cgroups before admitting new sessions.
 //
