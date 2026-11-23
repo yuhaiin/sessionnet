@@ -2,163 +2,160 @@
 
 [![CI](https://github.com/yuhaiin/sessionnet/actions/workflows/ci.yml/badge.svg)](https://github.com/yuhaiin/sessionnet/actions/workflows/ci.yml)
 
-`sessionnet` is a small Go module that starts Linux processes in an isolated network namespace and exposes their TUN packet stream to a supervising application. It is intended for integrations such as an SSH server whose shell commands must use an application-controlled routing and policy engine.
+`sessionnet` starts Linux processes in an isolated network environment and
+exposes its TUN packet stream to a supervising application. It is intended
+for integrations such as an SSH server whose commands must use an
+application-controlled routing and policy engine.
 
-**Status:** experimental Linux backend. The package is not an SSH server or a security sandbox.
+**Status:** experimental Linux backend. Not an SSH server and not a
+filesystem sandbox.
+
+## Modes
+
+- **Rootless (default).** No host privilege at all: no root, no `setcap`,
+  no `CAP_SYS_ADMIN` or `CAP_NET_ADMIN` on the host. Sessions get user,
+  network, mount and PID namespaces.
+- **Rootful.** For callers that are root: network, mount and PID namespaces
+  in the caller's user namespace, with an arbitrary non-root credential.
+
+Both modes share one implementation; only namespace creation and the
+credential switch differ.
 
 ## How it works
 
-1. Open a nonpersistent L3 TUN device with `IFF_TUN | IFF_NO_PI`.
-2. Start the session command behind a one-time startup gate in private network and mount namespaces as a non-root user.
-3. Move the TUN interface into that network namespace, configure IPv4 and optional IPv6 addresses, and set namespace-local default routes.
-4. Bind-mount an isolated `/etc/resolv.conf` with `172.31.254.1` as the DNS resolver. The host's DNS and routes are unchanged.
-5. Duplicate the TUN file descriptor into the supervising application's packet stack. Only after its packet handler is ready, call `Release()` to run the command.
-6. On cancellation or `Close()`, kill the session process group and release the owned TUN FD. The caller owns any duplicated FDs.
+1. `Open` re-executes the current binary (`/proc/self/exe`) as a helper,
+   cloned into `CLONE_NEWNET|CLONE_NEWNS|CLONE_NEWPID` (plus
+   `CLONE_NEWUSER` when rootless). The package dispatches the helper from an
+   `init` function, so the integrating binary needs no change to `main`.
+2. Rootless: while the helper waits on its `SOCK_SEQPACKET` control socket,
+   the parent writes identity UID/GID maps. It writes them directly for its
+   own IDs (denying `setgroups`), or for any ID when it has `CAP_SETUID`/
+   `CAP_SETGID`; subordinate IDs from `/etc/subuid`/`/etc/subgid` use
+   `newuidmap`/`newgidmap`, which are optional. Unmappable IDs fail before
+   anything is started.
+3. The helper, using capabilities of its own user namespace only, makes
+   mounts private, bind-mounts a session `resolv.conf` (and optionally an
+   `nsswitch.conf` with `hosts: files dns`) from an anonymous tmpfs, mounts a
+   `/proc` for the PID namespace, enables loopback, creates the TUN with
+   `TUNSETIFF`, and configures MTU, addresses and default routes via netlink
+   in its own namespace. It opens a `NETLINK_SOCK_DIAG` socket.
+4. The TUN, sock_diag socket and a network-namespace handle are sent to the
+   parent with `SCM_RIGHTS`.
+5. On one locked thread the helper clears the bounding set, locks securebits,
+   switches credentials (rootful), clears ambient/inheritable/permitted/
+   effective capabilities, sets `no_new_privs`, and `execve`s the supervisor.
+   The supervisor verifies `/proc/self/status` shows no privileges, becomes
+   non-dumpable, and reports ready. As PID 1 it starts commands, forwards
+   signals and reaps every process, including orphans.
 
-There is no NAT, built-in DNS server, or Internet access in this module. **The supervising application's packet stack must forward traffic and answer DNS.** If initialization fails, `Open()` fails and does not expose the host network as a fallback.
-
-## Address selection
-
-The default IPv4 link is `172.31.254.1` (gateway) and `172.31.254.2/30`
-(session). The optional IPv6 link is `fd42:7d2a:9b31::1` (gateway) and
-`fd42:7d2a:9b31::2/64` (session). The defaults deliberately avoid the
-`198.18.0.0/15` FakeIP benchmark range, `2001:2::/48` FakeIP IPv6 range,
-and Tailscale's `fd7a:115c:a1e0::/48` ULA prefix.
-
-An integrator can provide `Config.Addresses` as `AddressConfig` to choose
-another /30 IPv4 and /64 IPv6 subnet. `Resolve(ipv6)` applies defaults and
-validates the network endpoints. **The embedding application must additionally
-check these links for overlap with its active FakeIP or VPN routes**; no
-hardcoded private subnet can guarantee avoiding every deployment-specific route.
-
-## Strict process containment (cgroup v2)
-
-For SSH access, create one `CgroupManager` per listening SSH inbound:
-
-```go
-manager, err := sessionnet.NewCgroupManager("/sys/fs/cgroup/yuhaiin/ssh/<stable-inbound-id>")
-if err != nil { return err }
-defer manager.Close()
-
-session, err := sessionnet.Open(ctx, sessionnet.Config{
-    Command: []string{"/bin/sh", "-l"},
-    Credential: &sessionnet.Credential{UID: 65534, GID: 65534},
-    Cgroup: manager,
-})
-```
-
-The manager holds an exclusive lock on this stable cgroup v2 root, kills
-`session-*` cgroups left by the previous supervisor before accepting traffic,
-and fails closed if cleanup or locking is unavailable. The kernel atomically
-places the namespace owner and every `Session.Spawn` child in the same
-cgroup via `CLONE_INTO_CGROUP`. On shutdown `cgroup.kill` kills the full
-process tree, including detached process groups. No PID enumeration is used.
-
-The root MUST be a writable cgroup v2 directory delegated to the supervisor;
-not a normal data directory. Linux kernel 5.14+ with `cgroup.kill` and
-`clone3(CLONE_INTO_CGROUP)` support is required. The library never falls
-back to a racy post-start PID migration. Use one distinct, stable root per
-SSH inbound, and do not grant guest users write access to the cgroup tree.
-A running supervisor holds a root lock to prevent a second instance from
-reaping live sessions. The lock is automatically released if the process dies.
-
-With `Config.Cgroup == nil`, existing standalone callers retain the earlier
-best-effort process-group cleanup. SSH integrations SHOULD require a manager
-and refuse to enable the listener if the cgroup root cannot be prepared.
-Cgroup isolation does not isolate host filesystems or Unix sockets.
-
-## Requirements
-
-- Linux with `/dev/net/tun`, `CAP_SYS_ADMIN`, and `CAP_NET_ADMIN` for the supervising process.
-- A valid **non-root** UID/GID to run the command. The supplied supplementary groups replace inherited groups.
-- A packet stack that reads/writes raw L3 packets from the TUN FD and applies the application's routing policy.
-
-No CGO and no system networking CLI dependencies. Linux network setup uses `vishvananda/netlink`, `vishvananda/netns`, and `golang.org/x/sys/unix`. The package exposes API stubs that return `ErrUnsupported` on other operating systems.
+The parent never calls `setns`; nothing on the host (interfaces, routes,
+rules, firewall, `/etc/resolv.conf`) is changed. There is no NAT, DNS server
+or Internet access in this module: **the application's packet stack must
+forward traffic and answer DNS.** On any failure `Open` returns a
+`*SetupError` with a `Stage` and an actionable `Message`; it never exposes
+the host network as a fallback.
 
 ## Example
 
 ```go
-package example
-
-import (
-    "context"
-    "os"
-
-    "github.com/yuhaiin/sessionnet"
-)
-
-func run(ctx context.Context, stackFactory func(*os.File) (func() error, error)) error {
-    session, err := sessionnet.Open(ctx, sessionnet.Config{
-        Command: []string{"/bin/sh", "-l"},
-        Credential: &sessionnet.Credential{UID: 65534, GID: 65534},
-        IPv6: true,
-    })
-    if err != nil { return err }
-    defer session.Close()
-
-    packets, err := session.DupTun()
-    if err != nil { return err }
-    // stackFactory takes ownership of packets on success.
-    closeStack, err := stackFactory(packets)
-    if err != nil { _ = packets.Close(); return err }
-    defer closeStack()
-
-    // The child cannot connect until the packet stack is running.
-    if err := session.Release(); err != nil { return err }
-    return session.Wait()
+session, err := sessionnet.Open(ctx, sessionnet.Config{IPv6: true}) // rootless, caller's UID/GID
+if err != nil {
+    return err // e.g. "User Namespace is disabled: ..." or "/dev/net/tun is not accessible ..."
 }
+defer session.Close()
+
+packets, err := session.DupTun()
+if err != nil { return err }
+closeStack, err := stackFactory(packets) // takes ownership of packets
+if err != nil { _ = packets.Close(); return err }
+defer closeStack()
+
+if err := session.Release(); err != nil { return err } // packet path ready
+p, err := session.Spawn(ctx, sessionnet.Config{Command: []string{"/bin/sh", "-l"}, Stdin: in, Stdout: out, Stderr: out})
+if err != nil { return err }
+return p.Wait() // *sessionnet.ExitError for a non-zero exit
 ```
 
-The application stack needs `172.31.254.1` as a virtual IPv4 address (and `fd42:7d2a:9b31::1` for IPv6), must handle IP packets from the session's TUN, and must serve DNS on UDP/TCP port 53. The session has `172.31.254.2/30` and optionally `fd42:7d2a:9b31::2/64`. Local loopback (`127.0.0.1` and `::1`) intentionally remains inside the session namespace.
+`Config.Command` can instead name an initial command started by `Release`
+(`Wait`/`Signal` then refer to it). `DupDiag` and `DupNetNS` give an
+application socket-owner lookup inside the session without entering it.
+`Probe` opens and closes a session to check a host at startup.
+`SetupTimings` breaks down the cost of `Open`.
 
-The SSH server, authentication, PTYs, user identity, routing rules and all outbound connections belong to the integrating application. In Yuhaiin, the intended target is the existing lightweight network stack and inbound handlers.
+The application stack needs `172.31.254.1` (and `fd42:7d2a:9b31::1`) as
+virtual addresses and must serve DNS on port 53. Sessions have
+`172.31.254.2/30` and optionally `fd42:7d2a:9b31::2/64`; `Config.Addresses`
+selects others. Loopback stays inside the session.
+
+## Credentials
+
+In rootless mode the default credential is the caller's effective UID/GID,
+and every ID is identity-mapped, so file ownership keeps its host meaning.
+An unprivileged caller cannot call `setgroups` for the session (the kernel
+requires it to be denied), so the session **inherits the caller's
+supplementary groups**; `Credential.Groups` must then be empty. A caller
+with `CAP_SETGID`, or `newgidmap`, replaces them. Rootful sessions require
+an explicit non-root credential and always replace groups.
+
+Session processes have no capabilities, an empty bounding set and
+`no_new_privs`; setuid programs do not gain privilege.
+
+## Process containment
+
+Every session has a PID namespace. `Session.Close` kills PID 1; the kernel
+then kills all remaining processes, including detached and daemonized ones,
+before `Close` returns. If the parent dies, the supervisor sees EOF on its
+control socket and exits with the same effect.
+
+`CgroupManager` adds cgroup v2 containment on a writable, dedicated subtree:
+the helper is placed atomically with `CLONE_INTO_CGROUP`, `cgroup.kill` ends
+the tree, and a restarted supervisor reaps sessions orphaned by a crash. For
+rootless callers, `DelegatedCgroupRoot` returns a subtree of the caller's own
+cgroup only when systemd delegated it (`Delegate=yes`); otherwise use the
+PID namespace alone.
+
+## Requirements
+
+- Linux with user (rootless), network, mount and PID namespaces enabled;
+  unprivileged user namespaces allowed (`user.max_user_namespaces > 0`,
+  `kernel.unprivileged_userns_clone=1` where present, and no AppArmor
+  restriction such as Ubuntu's `kernel.apparmor_restrict_unprivileged_userns`).
+- `/dev/net/tun` accessible to the caller (kernel default mode `0666`).
+- A `/proc` that may be remounted in a user namespace.
+- Rootful: `CAP_SYS_ADMIN` and `CAP_NET_ADMIN`.
+
+No CGO and no networking CLI. Other operating systems get stubs returning
+`ErrUnsupported`.
 
 ## Limitations and security boundaries
 
-Local launchers can set `Config.IsolateDNS` to replace the private NSS
-`hosts` database with `files dns` and hide conventional nscd runtime directories.
-This keeps libc lookups from delegating to the host's `nss-resolve` or nscd
-services. Other NSS databases remain unchanged. An existing
-`/etc/nsswitch.conf` mount target is required. This is resolver isolation,
-not a restriction on arbitrary host Unix sockets or custom resolver services.
-
-`Session.Signal` forwards an operating-system signal to the session command
-using `os.Process.Signal`, including protection against signaling a recycled
-PID after `Wait`. Terminal job-control signals should use the controlling PTY.
-
-Duplicated packet FDs are nonblocking and registered with Go's file poller,
-so closing the FD interrupts an idle read during packet-stack shutdown.
-
-Measure resolver preparation and namespace lifecycle costs with:
-
-```sh
-go test -run '^$' -bench '^BenchmarkIsolatedNSS$' -benchmem -count=3
-SESSIONNET_INTEGRATION=1 go test -run '^$' -bench '^BenchmarkLinuxSessionLifecycle$' -benchmem -count=3
-```
-
-The lifecycle benchmark needs namespace/TUN privileges and excludes packet
-processing and Internet traffic.
-
-- **This is network isolation, not a general-purpose sandbox.** It does not isolate the host filesystem, processes, Unix-domain sockets, inherited descriptors, or setuid programs. Do not expose untrusted SSH users without separate filesystem/privilege isolation and a narrowly scoped privileged helper.
-- The supervisor requires broad Linux capabilities. A production deployment should move privileged setup into an audited helper and drop privileges before accepting user input.
-- Process-group cleanup is only best-effort without `Config.Cgroup`; for SSH or long-lived sessions, require `CgroupManager` to kill all descendants and recover orphaned groups at startup.
-- Namespace-local routes alone do not stop a sufficiently privileged guest from changing its own network configuration; the command should always run without effective networking capabilities.
-- Do not use application packet handling or resolver failures as a reason to dial directly from the isolated process. The integrating application must fail closed and close the session when its packet stack stops.
-- Network configuration uses namespace-scoped Netlink handles. The resolver bind mount uses `setns`, `unshare(CLONE_FS)`, and `mount` syscalls on a locked OS thread. Namespace restoration is mandatory before returning the thread to Go.
-- It has not yet been tested with a production SSH implementation.
+- **Network isolation, not a sandbox.** The host filesystem, filesystem
+  Unix-domain sockets and inherited descriptors are shared. In rootless mode
+  the session normally runs as the caller's own account and can access all
+  of its files.
+- The session `/proc` hides host processes, so same-user host processes
+  cannot be inspected or ptraced from a session.
+- Closing the last TUN descriptor unregisters the netdev, which costs the
+  kernel ~10–20 ms of RCU grace periods; `Close` includes it.
+- A target file that is itself a bind mount of a deleted file (left by older
+  releases) cannot be mounted over; this is reported explicitly.
 
 ## Testing
 
 ```bash
-go test ./...
-go test -race ./...
-go vet ./...
-
-# Requires a suitably privileged Linux VM or host.
-SESSIONNET_INTEGRATION=1 go test -run TestLinuxSessionIntegration -v ./...
-
-# Requires a writable, dedicated cgroup v2 parent on a test VM.
-SESSIONNET_CGROUP_TEST_ROOT=/sys/fs/cgroup/sessionnet-test go test -run 'TestLinuxCgroup' -v ./...
+go test -race ./...                       # rootless tests run as a normal user
+SESSIONNET_REQUIRE_ROOTLESS=1 go test -v ./...   # fail instead of skip
 ```
 
-Ordinary unit tests require no capabilities. CI runs formatting, unit tests, race detection, vetting, cross-platform builds, and privileged Linux namespace tests on an ephemeral GitHub-hosted runner. Locally, privileged tests are opt-in and should run only on an isolated test host.
+Rootless tests skip, with the reason, only when the host cannot create
+rootless sessions. Failure handling (disabled user/PID/network namespaces,
+missing, inaccessible or invalid TUN, rejected UID/GID maps, cancellation)
+is tested in nested user namespaces, and rootful mode runs as root of a
+`newuidmap` namespace, so none of it needs host root. `TestRootfulModeAsRoot`
+and the cgroup tests run on a real root CI host:
+
+```bash
+SESSIONNET_CGROUP_TEST_ROOT=/sys/fs/cgroup/<delegated> go test -run TestLinuxCgroup -v .
+SESSIONNET_BENCH_MODES=1 go test -run TestBenchmarkModesSameEnvironment -v .
+go test -run '^$' -bench BenchmarkSession -benchtime=200x .
+```
