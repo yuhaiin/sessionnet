@@ -5,6 +5,7 @@ package sessionnet
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -24,9 +25,26 @@ func readSysctl(name string) string {
 // namespace exist but deny it capabilities, which only shows up later.
 func userNamespacePolicyHint() string {
 	if readSysctl("kernel/apparmor_restrict_unprivileged_userns") == "1" {
-		return " (AppArmor restricts unprivileged user namespaces: kernel.apparmor_restrict_unprivileged_userns=1; allow Yuhaiin with an AppArmor profile or disable the restriction)"
+		return " (" + appArmorUsernsMessage() + ")"
 	}
 	return ""
+}
+
+// appArmorUsernsMessage names the executable that needs the permission, so
+// the remedy can be applied as written.
+func appArmorUsernsMessage() string {
+	exe, err := os.Executable()
+	if err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+	} else {
+		exe = "<path to the executable>"
+	}
+	return "User namespaces are restricted by AppArmor (kernel.apparmor_restrict_unprivileged_userns=1): " +
+		"allow this program with an AppArmor profile granting \"userns,\" for " + exe +
+		" (for example /etc/apparmor.d/yuhaiin with \"profile yuhaiin " + exe + " flags=(unconfined) { userns, }\", then apparmor_parser -r), " +
+		"or have an administrator disable the restriction system-wide; both require root, and rootful mode requires root as well"
 }
 
 // classifyStartError turns a failed clone of the session helper into an
@@ -45,6 +63,13 @@ func classifyStartError(mode Mode, err error) error {
 		if readSysctl("user/max_user_namespaces") == "0" {
 			return &SetupError{Stage: StageUserNamespace, Err: err,
 				Message: "User Namespace is disabled: user.max_user_namespaces is 0; raise it with sysctl or use rootful mode"}
+		}
+		// Ubuntu 23.10+ lets the clone succeed but denies the new user
+		// namespace to processes without an AppArmor "userns" permission,
+		// which surfaces as EACCES/EPERM when the helper is executed.
+		if (errno == unix.EACCES || errno == unix.EPERM) && os.Geteuid() != 0 &&
+			readSysctl("kernel/apparmor_restrict_unprivileged_userns") == "1" {
+			return &SetupError{Stage: StageUserNamespace, Err: err, Message: appArmorUsernsMessage()}
 		}
 	}
 	for _, limit := range []struct {
