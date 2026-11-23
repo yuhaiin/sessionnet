@@ -1,7 +1,18 @@
 // Package sessionnet provides isolated process networking sessions.
-// The Linux backend configures private network and mount namespaces with a
-// TUN device. The integrating application owns packet processing and policy.
-// It is not a general-purpose filesystem or privilege sandbox.
+//
+// On Linux every session is owned by a helper process that the integrating
+// binary re-executes from HelperPath (/proc/self/exe by default). The helper
+// is cloned into private network, mount and PID namespaces, and in the
+// default rootless mode into a user namespace as well, so no host privilege
+// is required. It creates the TUN inside its own network namespace, passes
+// the packet descriptor to the caller over SCM_RIGHTS, drops every
+// capability and then supervises the session's processes as PID 1.
+//
+// The package dispatches the helper from an init function, so any binary
+// that imports it can act as its own helper; no change to main is needed.
+//
+// The integrating application owns packet processing and policy. This is
+// network isolation, not a general-purpose filesystem or privilege sandbox.
 package sessionnet
 
 import (
@@ -10,6 +21,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"time"
 )
 
 const (
@@ -95,24 +107,59 @@ func validateLink(gateway netip.Addr, session netip.Prefix, ipv6 bool) error {
 
 var ErrUnsupported = errors.New("sessionnet: platform is not supported")
 
-// Credential names a non-root Unix user. Supplementary groups are explicitly
-// replaced with Groups, including when it is empty.
+// Mode selects how the session namespaces are created.
+type Mode string
+
+const (
+	// ModeRootless creates a user namespace first, so no host capability is
+	// required. It is the default. The TUN, routes, resolver and process
+	// supervisor all live inside namespaces owned by that user namespace.
+	ModeRootless Mode = "rootless"
+	// ModeRootful creates network, mount and PID namespaces in the caller's
+	// user namespace. The caller needs CAP_SYS_ADMIN and CAP_NET_ADMIN there.
+	ModeRootful Mode = "rootful"
+)
+
+// Resolve returns ModeRootless for the zero value and rejects unknown modes.
+func (m Mode) Resolve() (Mode, error) {
+	switch m {
+	case "", ModeRootless:
+		return ModeRootless, nil
+	case ModeRootful:
+		return ModeRootful, nil
+	default:
+		return "", fmt.Errorf("sessionnet: unknown namespace mode %q", string(m))
+	}
+}
+
+// Credential names a non-root Unix user. In rootful mode, and in rootless
+// mode when the caller may call setgroups(2) for the session (it is root, or
+// newgidmap mapped the group), supplementary groups are replaced with Groups.
+// Otherwise the kernel forbids setgroups in the user namespace, the session
+// inherits the caller's supplementary groups and Groups must be empty.
 type Credential struct {
 	UID    uint32
 	GID    uint32
 	Groups []uint32
 }
 
-// Config describes an isolated command. Its network namespace has no host
+// Config describes an isolated session. Its network namespace has no host
 // uplink. Callers must provide a working packet handler before Release.
 //
-// This does not restrict filesystem access, Unix sockets, inherited file
-// descriptors or setuid executables. Do not expose a shell to untrusted users
-// without an additional sandbox and a narrowly scoped privileged helper.
+// This does not restrict filesystem access, filesystem Unix sockets or
+// inherited file descriptors. Do not expose a shell to untrusted users
+// without an additional filesystem sandbox.
 type Config struct {
-	Command    []string
-	Env        []string
-	Dir        string
+	// Mode defaults to ModeRootless.
+	Mode Mode
+	// Command optionally names the session's initial command. It is started
+	// by Release. Without a command, the session is an idle namespace that
+	// Spawn can use; Done and Wait then track the session supervisor.
+	Command []string
+	Env     []string
+	Dir     string
+	// Credential is required in rootful mode. In rootless mode a nil
+	// credential selects the caller's effective UID and GID.
 	Credential *Credential
 	Stdin      io.Reader
 	Stdout     io.Writer
@@ -128,6 +175,101 @@ type Config struct {
 	// known host nscd socket directories. Other NSS databases are preserved.
 	IsolateDNS bool
 	// Cgroup places this session and all commands spawned from it in a
-	// managed cgroup v2. When unset, process-group cleanup is best-effort.
+	// managed cgroup v2. Without it, the PID namespace supervisor still kills
+	// every descendant when the session closes; the cgroup additionally lets
+	// a restarted supervisor reap sessions orphaned by a crash.
 	Cgroup *CgroupManager
+	// HelperPath is the executable re-executed as the session helper. It
+	// defaults to /proc/self/exe; see the package documentation.
+	HelperPath string
+}
+
+// SetupTimings breaks down how long Open took.
+type SetupTimings struct {
+	// Spawn covers clone(2) of the namespaces and the helper's execve.
+	Spawn time.Duration
+	// IDMap covers writing the user namespace UID/GID maps (rootless).
+	IDMap time.Duration
+	// Handshake runs from sending the init request to receiving the TUN
+	// descriptor; it includes the helper's runtime start and the phases below.
+	Handshake   time.Duration
+	Credentials time.Duration
+	Mounts      time.Duration
+	TUN         time.Duration
+	Network     time.Duration
+	Diagnostics time.Duration
+	// Supervisor covers dropping privileges and starting the supervisor.
+	Supervisor time.Duration
+	Total      time.Duration
+}
+
+// Stage identifies the part of session setup that failed.
+type Stage string
+
+const (
+	StageUserNamespace Stage = "user-namespace"
+	StageNamespaces    Stage = "namespaces"
+	StagePIDNamespace  Stage = "pid-namespace"
+	StageUIDMap        Stage = "uid-map"
+	StageGIDMap        Stage = "gid-map"
+	StageCredentials   Stage = "credentials"
+	StageMount         Stage = "mount"
+	StageResolver      Stage = "resolver"
+	StageTUN           Stage = "tun"
+	StageNetwork       Stage = "network"
+	StageDiagnostics   Stage = "diagnostics"
+	StagePrivileges    Stage = "privileges"
+	StageCgroup        Stage = "cgroup"
+	StageHelper        Stage = "helper"
+	StageHandshake     Stage = "handshake"
+)
+
+// SetupError reports why a session could not be created. Message is a
+// complete, user-facing explanation including the likely remedy; Err holds
+// the underlying system error for logs and errors.Is.
+type SetupError struct {
+	Stage   Stage
+	Message string
+	Err     error
+}
+
+func (e *SetupError) Error() string {
+	if e.Err == nil {
+		return "sessionnet: " + e.Message
+	}
+	return "sessionnet: " + e.Message + ": " + e.Err.Error()
+}
+
+func (e *SetupError) Unwrap() error { return e.Err }
+
+// ExitError reports that a session command did not exit successfully.
+type ExitError struct {
+	// Status is the raw wait(2) status.
+	Status uint32
+}
+
+// Exited reports whether the command terminated normally.
+func (e *ExitError) Exited() bool { return e.Status&0x7f == 0 }
+
+// Signal returns the terminating signal number, or 0 if the command exited.
+func (e *ExitError) Signal() int {
+	if e.Exited() {
+		return 0
+	}
+	return int(e.Status & 0x7f)
+}
+
+// ExitCode returns the exit code, or -1 if the command was killed by a signal.
+func (e *ExitError) ExitCode() int {
+	if !e.Exited() {
+		return -1
+	}
+	return int(e.Status>>8) & 0xff
+}
+
+func (e *ExitError) Error() string {
+	if e.Exited() {
+		return fmt.Sprintf("exit status %d", e.ExitCode())
+	}
+	return fmt.Sprintf("signal %d", e.Signal())
 }

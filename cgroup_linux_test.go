@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -64,16 +65,7 @@ func TestLinuxCgroupProcessContainment(t *testing.T) {
 	defer manager.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	read, write, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer read.Close()
-	defer write.Close()
-	owner, err := Open(ctx, Config{
-		Command:    []string{"/bin/sh", "-c", "read -r keepalive"},
-		Credential: unprivileged(), Stdin: read, Cgroup: manager,
-	})
+	owner, err := Open(ctx, cgroupTestConfig(manager))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,14 +73,12 @@ func TestLinuxCgroupProcessContainment(t *testing.T) {
 	if err := owner.Release(); err != nil {
 		t.Fatal(err)
 	}
-	child, err := owner.Spawn(ctx, Config{
-		Command:    []string{"/bin/sh", "-c", "sleep 120"},
-		Credential: unprivileged(),
-	})
+	child, err := owner.Spawn(ctx, Config{Command: []string{"/bin/sh", "-c", processTree + "\nsleep 120"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer child.Close()
+	time.Sleep(500 * time.Millisecond)
 	names, err := managedGroupNames(root)
 	if err != nil || len(names) != 1 {
 		t.Fatalf("expected one session cgroup: %v %v", names, err)
@@ -97,15 +87,9 @@ func TestLinuxCgroupProcessContainment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := strconv.Itoa(child.PID())
-	found := false
-	for _, item := range strings.Fields(string(processes)) {
-		if item == expected {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("spawned process %s is not in managed cgroup: %q", expected, processes)
+	members := strings.Fields(string(processes))
+	if !slices.Contains(members, strconv.Itoa(owner.PID())) || len(members) < 8 {
+		t.Fatalf("session helper and descendants must be in the managed cgroup: %q", processes)
 	}
 	if err := owner.Close(); err != nil {
 		t.Fatal(err)
@@ -118,6 +102,48 @@ func TestLinuxCgroupProcessContainment(t *testing.T) {
 	names, err = managedGroupNames(root)
 	if err != nil || len(names) != 0 {
 		t.Fatalf("session cgroup was not removed: %v %v", names, err)
+	}
+}
+
+// cgroupTestConfig uses rootless mode unless the test runs as root, which
+// is how CI exercises cgroups on a root-owned hierarchy.
+func cgroupTestConfig(manager *CgroupManager) Config {
+	if os.Geteuid() == 0 {
+		return Config{Mode: ModeRootful, Credential: unprivileged(), Cgroup: manager}
+	}
+	return Config{Cgroup: manager}
+}
+
+func TestCgroupReadOnlyRootFails(t *testing.T) {
+	// The cgroup v2 mount point and service-manager owned directories are
+	// not writable for a normal user; the manager must fail closed.
+	if os.Geteuid() == 0 {
+		t.Skip("root can write every cgroup")
+	}
+	var stat unix.Statfs_t
+	if unix.Statfs("/sys/fs/cgroup", &stat) != nil || stat.Type != unix.CGROUP2_SUPER_MAGIC {
+		t.Skip("cgroup v2 is not mounted")
+	}
+	for _, root := range []string{"/sys/fs/cgroup/sessionnet-readonly-test", "/sys/fs/cgroup/init.scope/sessionnet-test"} {
+		if manager, err := NewCgroupManager(root); err == nil {
+			_ = manager.Close()
+			t.Fatalf("read-only cgroup %s was accepted", root)
+		}
+	}
+}
+
+func TestDelegatedCgroupRootRequiresMarker(t *testing.T) {
+	root, err := DelegatedCgroupRoot("sessionnet-test")
+	if err != nil {
+		if !errors.Is(err, ErrNoDelegatedCgroup) {
+			t.Fatal(err)
+		}
+		t.Logf("no delegation here, the PID namespace supervisor is used: %v", err)
+		return
+	}
+	t.Logf("delegated cgroup available at %s", root)
+	if _, err := DelegatedCgroupRoot("../escape"); err == nil {
+		t.Fatal("cgroup names must not traverse")
 	}
 }
 

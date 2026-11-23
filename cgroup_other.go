@@ -14,3 +14,8 @@ func NewCgroupManager(string) (*CgroupManager, error) {
 func (*CgroupManager) Close() error {
 	return errors.ErrUnsupported
 }
+
+// ErrNoDelegatedCgroup reports that the caller's cgroup was not delegated.
+var ErrNoDelegatedCgroup = errors.New("sessionnet: cgroup delegation is unavailable")
+
+func DelegatedCgroupRoot(string) (string, error) { return "", ErrUnsupported }
