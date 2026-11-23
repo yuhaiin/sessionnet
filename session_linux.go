@@ -181,6 +181,11 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	}()
 	defer func() {
 		if err != nil {
+			// A canceled context kills the helper, so later setup steps fail
+			// with incidental errors; report the cancellation instead.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				err = ctxErr
+			}
 			s.abortSetup()
 		}
 	}()
