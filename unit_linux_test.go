@@ -19,24 +19,27 @@ func TestValidation(t *testing.T) {
 	cred := Credential{UID: 65534, GID: 65534}
 	tests := []struct {
 		name     string
+		mode     Mode
 		cfg      Config
 		cred     Credential
 		contains string
 	}{
-		{"empty command", Config{Command: []string{}}, cred, "command"},
-		{"blank command", Config{Command: []string{" "}}, cred, "command"},
-		{"no command is an idle session", Config{}, cred, ""},
-		{"root account", Config{Command: []string{"/bin/true"}}, Credential{}, "unprivileged"},
-		{"privileged group", Config{Command: []string{"/bin/true"}}, Credential{UID: 65534, GID: 65534, Groups: []uint32{0}}, "supplementary root group"},
-		{"bad mtu", Config{Command: []string{"/bin/true"}, MTU: 9001}, cred, "MTU"},
-		{"small mtu", Config{Command: []string{"/bin/true"}, MTU: 1279}, cred, "MTU"},
-		{"valid lower mtu", Config{Command: []string{"/bin/true"}, MTU: 1280}, cred, ""},
-		{"valid upper mtu", Config{Command: []string{"/bin/true"}, MTU: 9000}, cred, ""},
-		{"pty and stdin", Config{Command: []string{"/bin/true"}, PTYSlave: os.Stdin, Stdin: os.Stdin}, cred, "PTYSlave"},
+		{"empty command", ModeRootless, Config{Command: []string{}}, cred, "command"},
+		{"blank command", ModeRootless, Config{Command: []string{" "}}, cred, "command"},
+		{"no command is an idle session", ModeRootless, Config{}, cred, ""},
+		{"rootful root account", ModeRootful, Config{Command: []string{"/bin/true"}}, Credential{}, "unprivileged"},
+		{"rootful root group", ModeRootful, Config{Command: []string{"/bin/true"}}, Credential{UID: 65534, GID: 65534, Groups: []uint32{0}}, "supplementary root group"},
+		{"rootless root account", ModeRootless, Config{Command: []string{"/bin/true"}}, Credential{}, ""},
+		{"rootless root group", ModeRootless, Config{Command: []string{"/bin/true"}}, Credential{UID: 65534, GID: 65534, Groups: []uint32{0}}, ""},
+		{"bad mtu", ModeRootless, Config{Command: []string{"/bin/true"}, MTU: 9001}, cred, "MTU"},
+		{"small mtu", ModeRootless, Config{Command: []string{"/bin/true"}, MTU: 1279}, cred, "MTU"},
+		{"valid lower mtu", ModeRootless, Config{Command: []string{"/bin/true"}, MTU: 1280}, cred, ""},
+		{"valid upper mtu", ModeRootless, Config{Command: []string{"/bin/true"}, MTU: 9000}, cred, ""},
+		{"pty and stdin", ModeRootless, Config{Command: []string{"/bin/true"}, PTYSlave: os.Stdin, Stdin: os.Stdin}, cred, "PTYSlave"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validate(tt.cfg, ModeRootless, tt.cred)
+			err := validate(tt.cfg, tt.mode, tt.cred)
 			if tt.contains == "" {
 				if err != nil {
 					t.Fatal(err)
