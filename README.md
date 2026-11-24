@@ -118,7 +118,7 @@ only stop the chain early, never make a namespace look shallower. Results:
 |---|---|---|
 | Initial namespace (native) | host IDs (identity map) | own; any with `CAP_SETUID`/`CAP_SETGID`; `/etc/subuid` via `newuidmap` |
 | Depth 1 (`podman unshare`, `unshare -U`, rootless containers) | host IDs, translated through the caller's map | own; any ID the caller's map covers with `CAP_SETUID`/`CAP_SETGID` |
-| Deeper or unmeasurable | the caller's namespace IDs | the caller's own identity only (nothing else can be verified) |
+| Deeper or unmeasurable | the caller's namespace IDs | the caller's own identity only (nothing else can be verified), unless `ParentUID`/`ParentGID` name the parent IDs explicitly |
 
 IDs that cannot be translated are rejected with a `uid-map`/`gid-map`
 `SetupError`; nothing is guessed or substituted. The pure functions
@@ -126,6 +126,31 @@ IDs that cannot be translated are rejected with a `uid-map`/`gid-map`
 `LookupIDChain` implement the translation. Mapping UID 0 of the caller's
 namespace (the Podman case) needs `CAP_SETFCAP` there (Linux 5.12+), which
 namespace root normally holds.
+
+### Manual parent namespace IDs
+
+Deeper nesting is not a kernel limit. Writing a child map needs only IDs of
+the writer's own namespace (the session's immediate parent), and the kernel
+checks those itself; what a nested process cannot do is *see* what they are
+on the host. `Credential.ParentUID`/`ParentGID` therefore let the caller
+state the pairing directly, keeping the session (target) IDs separate:
+
+```
+Credential{UID: 1009, GID: 1009, ParentUID: &zero, ParentGID: &zero}
+-> session uid_map "1009 0 1", gid_map "1009 0 1"
+```
+
+They are IDs of the caller's namespace, never host IDs. They must exist in
+the caller's `uid_map`/`gid_map`, they go through the same permission rules
+as automatic IDs (own ID, or `CAP_SETUID`/`CAP_SETGID`; `CAP_SETFCAP` for the
+caller's UID 0; another GID needs a namespace that allows `setgroups`), and
+where host IDs are resolvable an override must agree with the automatic
+result. The kernel rejects anything else. `Inspect` lists the usable parent
+IDs (`ParentUIDRanges`, `ParentGIDRanges`). Rootful sessions refuse them.
+
+For every rootless session the helper reads `/proc/self/uid_map`, `gid_map`
+and its real/effective/saved IDs inside the session after switching to them,
+and `Open` fails unless they equal the plan.
 
 The rootless default credential (`DefaultCredential`, or a nil
 `Config.Credential`) is the caller's own identity. It **keeps the caller's
@@ -209,6 +234,17 @@ go test -c -o sessionnet.test .
 podman unshare env SESSIONNET_REQUIRE_INHERITED=1 SESSIONNET_EXPECT_HOST_UID=$(id -u) \
     SESSIONNET_EXPECT_HOST_GID=$(id -g) SESSIONNET_GROUP_DIR=/srv/group-only \
     SESSIONNET_DENIED_DIR=/root ./sessionnet.test -test.run InPlace -test.v
+```
+
+`TestDeeperNamespaceManualParent` builds a two-level hierarchy (test user →
+`0 <uid> 1` → `0 0 1`) and checks that host IDs are refused there while a
+manual parent override gives the expected map and file access. In place,
+one namespace below Podman:
+
+```bash
+podman unshare unshare --user --map-root-user env SESSIONNET_REQUIRE_DEEPER=1 \
+    SESSIONNET_EXPECT_HOST_UID=$(id -u) SESSIONNET_EXPECT_HOST_GID=$(id -g) \
+    ./sessionnet.test -test.run DeeperNamespaceInPlace -test.v
 ``` Failure handling (disabled user/PID/network namespaces,
 missing, inaccessible or invalid TUN, rejected UID/GID maps, cancellation)
 is tested in nested user namespaces, and rootful mode runs as root of a

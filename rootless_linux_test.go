@@ -36,6 +36,10 @@ func TestMain(m *testing.M) {
 		os.Exit(runFailureScenario(strings.TrimPrefix(mode, "scenario:")))
 	case mode == "crash-parent":
 		os.Exit(runCrashParent())
+	case mode == "nest-deeper":
+		os.Exit(runNestDeeper())
+	case mode == "manual-parent":
+		os.Exit(runManualParent())
 	case mode == "listen":
 		os.Exit(runListener())
 	default:

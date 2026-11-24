@@ -148,6 +148,17 @@ type Credential struct {
 	UID    uint32
 	GID    uint32
 	Groups []uint32
+	// ParentUID and ParentGID optionally name, for rootless sessions, the IDs
+	// of the caller's own user namespace (the session's immediate parent)
+	// that UID and GID map to, instead of the automatic translation. They
+	// are IDs of that namespace, never host IDs: under `podman unshare`
+	// session UID 1009 has parent UID 0. Use them only when the automatic
+	// translation cannot resolve the caller's namespace (it is nested more
+	// than one level deep); where it can, an override must agree with it.
+	// The kernel still decides whether the caller may map the ID, and the
+	// session verifies the result from inside.
+	ParentUID *uint32
+	ParentGID *uint32
 }
 
 // Config describes an isolated session. Its network namespace has no host

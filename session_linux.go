@@ -90,7 +90,20 @@ func resolveCredential(mode Mode, cred *Credential, self identity) (Credential, 
 		}
 		return self.defaultCredential(), nil
 	}
-	return Credential{UID: cred.UID, GID: cred.GID, Groups: append([]uint32{}, cred.Groups...)}, nil
+	return cloneCredential(*cred), nil
+}
+
+func cloneCredential(c Credential) Credential {
+	out := Credential{UID: c.UID, GID: c.GID, Groups: append([]uint32{}, c.Groups...)}
+	if c.ParentUID != nil {
+		v := *c.ParentUID
+		out.ParentUID = &v
+	}
+	if c.ParentGID != nil {
+		v := *c.ParentGID
+		out.ParentGID = &v
+	}
+	return out
 }
 
 // Open creates the session namespaces, its TUN, routes and resolver and a
@@ -246,6 +259,11 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 		return nil, &SetupError{Stage: StageHandshake, Message: "the session helper sent an invalid handshake"}
 	}
 	s.tun, s.diag, s.netns = files[0], files[1], files[2]
+	if mode == ModeRootless {
+		if err = verifyInsideIdentity(ready.Ready, cred, plan); err != nil {
+			return nil, err
+		}
+	}
 	handshake := time.Now()
 	if r := ready.Ready; r != nil {
 		s.timings.Credentials, s.timings.Mounts, s.timings.TUN = time.Duration(r.Credentials), time.Duration(r.Mounts), time.Duration(r.TUN)
@@ -417,7 +435,7 @@ func (s *Session) Mode() Mode { return s.mode }
 
 // Credential returns the session IDs every session process runs as.
 func (s *Session) Credential() Credential {
-	return Credential{UID: s.cred.UID, GID: s.cred.GID, Groups: append([]uint32{}, s.cred.Groups...)}
+	return cloneCredential(s.cred)
 }
 
 // UIDToCaller translates a UID of the session's user namespace, such as a

@@ -126,6 +126,12 @@ func (id identity) callerGID(session uint32) (uint32, bool) {
 // CAP_SETUID, or delegated subordinate UIDs in the initial namespace. With
 // CAP_SETFCAP missing, the caller namespace's UID 0 cannot be mapped.
 func (id identity) usableUIDs() []IDRange {
+	return id.toSessionRanges(id.usableParentUIDs(), id.ns.UIDMap, id.UID)
+}
+
+// usableParentUIDs lists the caller-namespace UIDs a session UID may map to,
+// which is what a manual ParentUID may name.
+func (id identity) usableParentUIDs() []IDRange {
 	callerRanges := []IDRange{{Start: id.UID, Count: 1}}
 	if id.CapSetUID {
 		callerRanges = namespaceRanges(id.ns.UIDMap)
@@ -135,19 +141,25 @@ func (id identity) usableUIDs() []IDRange {
 	if !id.CapSetFCAP {
 		callerRanges = withoutID(callerRanges, 0)
 	}
-	return id.toSessionRanges(callerRanges, id.ns.UIDMap, id.UID)
+	return callerRanges
 }
 
 // usableGIDs lists the session GIDs planIDMaps accepts as the primary group
 // of a credential without supplementary groups.
 func (id identity) usableGIDs() []IDRange {
+	return id.toSessionRanges(id.usableParentGIDs(), id.ns.GIDMap, id.GID)
+}
+
+// usableParentGIDs lists the caller-namespace GIDs a primary session GID may
+// map to.
+func (id identity) usableParentGIDs() []IDRange {
 	callerRanges := []IDRange{{Start: id.GID, Count: 1}}
 	if id.CapSetGID && id.ns.SetgroupsAllowed {
 		callerRanges = namespaceRanges(id.ns.GIDMap)
 	} else if id.newgidm != "" {
 		callerRanges = append(callerRanges, subordinateRanges(id.subGIDs)...)
 	}
-	return id.toSessionRanges(callerRanges, id.ns.GIDMap, id.GID)
+	return callerRanges
 }
 
 func namespaceRanges(m IDMap) []IDRange {
@@ -249,8 +261,8 @@ func unmappedIDError(self identity, stage Stage, kind string, id uint32) error {
 	}
 	if !self.ns.HostIDs() {
 		return &SetupError{Stage: stage, Message: fmt.Sprintf(
-			"%s mapping failed: Yuhaiin runs in a nested user namespace whose host IDs cannot be resolved (%s), so only its own identity (%s %d of its namespace) can be used; %s %d cannot be verified. Leave the %s empty to use Yuhaiin's identity",
-			kind, describeDepth(self.ns), kind, own, kind, id, kind)}
+			"%s mapping failed: Yuhaiin runs in a nested user namespace whose host IDs cannot be resolved (%s), so only its own identity (%s %d of its namespace) can be used automatically; %s %d cannot be verified. Leave the %s empty to use Yuhaiin's identity, or name the parent namespace %s it maps to explicitly",
+			kind, describeDepth(self.ns), kind, own, kind, id, kind, kind)}
 	}
 	return &SetupError{Stage: stage, Message: fmt.Sprintf(
 		"%s mapping failed: host %s %d is not mapped into the user namespace Yuhaiin runs in, which maps only host %ss %s",
@@ -283,9 +295,9 @@ func describeParentRanges(m IDMap) string {
 // "1009 0 1", so the session runs as host UID 1009 and sees it as 1009.
 func planIDMaps(self identity, cred Credential) (idMapPlan, error) {
 	var plan idMapPlan
-	outUID, ok := self.callerUID(cred.UID)
-	if !ok {
-		return plan, unmappedIDError(self, StageUIDMap, "UID", cred.UID)
+	outUID, err := self.parentID(StageUIDMap, "UID", cred.UID, cred.ParentUID)
+	if err != nil {
+		return plan, err
 	}
 	uidLine := fmt.Sprintf("%d %d 1", cred.UID, outUID)
 	switch {
@@ -321,9 +333,17 @@ func planIDMaps(self identity, cred Credential) (idMapPlan, error) {
 		}
 	}
 	outGIDs := make([]uint32, len(gids))
-	for i, gid := range gids {
-		if outGIDs[i], ok = self.callerGID(gid); !ok {
-			return plan, unmappedIDError(self, StageGIDMap, "GID", gid)
+	if outGIDs[0], err = self.parentID(StageGIDMap, "GID", cred.GID, cred.ParentGID); err != nil {
+		return plan, err
+	}
+	for i := 1; i < len(gids); i++ {
+		var ok bool
+		if outGIDs[i], ok = self.callerGID(gids[i]); !ok {
+			return plan, unmappedIDError(self, StageGIDMap, "GID", gids[i])
+		}
+		if outGIDs[i] == outGIDs[0] {
+			return plan, &SetupError{Stage: StageGIDMap, Message: fmt.Sprintf(
+				"GID mapping failed: supplementary group %d and the primary group %d would both be parent GID %d", gids[i], cred.GID, outGIDs[0])}
 		}
 	}
 	gidLines := func() []string {
@@ -375,12 +395,63 @@ func planIDMaps(self identity, cred Credential) (idMapPlan, error) {
 	return plan, nil
 }
 
+// parentID selects the caller-namespace ID a session ID maps to: the
+// automatic translation, or a manual override of the session's immediate
+// parent ID. An override is accepted only for an ID the caller's namespace
+// really maps, and, where the automatic translation can resolve host IDs,
+// only if it agrees with it: otherwise the session would show one host ID
+// while acting as another. Whether the caller may map the ID at all is
+// checked by planIDMaps and finally by the kernel.
+func (id identity) parentID(stage Stage, kind string, session uint32, override *uint32) (uint32, error) {
+	m, callerID := id.ns.UIDMap, id.callerUID
+	if kind == "GID" {
+		m, callerID = id.ns.GIDMap, id.callerGID
+	}
+	auto, autoOK := callerID(session)
+	if override == nil {
+		if !autoOK {
+			return 0, unmappedIDError(id, stage, kind, session)
+		}
+		return auto, nil
+	}
+	parent := *override
+	if _, mapped := m.ToParent(parent); !mapped {
+		return 0, &SetupError{Stage: stage, Message: fmt.Sprintf(
+			"%s mapping failed: the manual parent namespace %s %d does not exist in the user namespace Yuhaiin runs in, which maps only %ss %s",
+			kind, kind, parent, kind, describeNamespaceRanges(m))}
+	}
+	if id.ns.HostIDs() {
+		host, _ := id.ns.toHost(m, parent)
+		if !autoOK || auto != parent {
+			return 0, &SetupError{Stage: stage, Message: fmt.Sprintf(
+				"%s mapping failed: the manual parent namespace %s %d is host %s %d, not the session %s %d; Yuhaiin resolves host IDs automatically here, so remove the override",
+				kind, kind, parent, kind, host, kind, session)}
+		}
+	}
+	return parent, nil
+}
+
+func describeNamespaceRanges(m IDMap) string {
+	return describeParentRanges(namespaceAsParent(m))
+}
+
+func namespaceAsParent(m IDMap) IDMap {
+	out := make(IDMap, len(m))
+	for i, r := range m {
+		out[i] = IDMapping{ParentID: r.NamespaceID, Count: r.Count}
+	}
+	return out
+}
+
 // rootfulCredential translates session IDs into the caller's namespace, in
 // which rootful sessions run. Neither the session IDs nor the IDs they stand
 // for may be root.
 func rootfulCredential(self identity, cred Credential) (Credential, error) {
 	var out Credential
 	var ok bool
+	if cred.ParentUID != nil || cred.ParentGID != nil {
+		return out, errors.New("sessionnet: parent namespace IDs only apply to rootless sessions; rootful sessions run in the caller's user namespace")
+	}
 	if out.UID, ok = self.callerUID(cred.UID); !ok {
 		return out, unmappedIDError(self, StageCredentials, "UID", cred.UID)
 	}
@@ -471,4 +542,49 @@ func writeMap(pid int, file, tool string, lines []string) error {
 		return fmt.Errorf("%s: %w", tool, err)
 	}
 	return nil
+}
+
+// verifyInsideIdentity compares what the helper read inside the session
+// (its /proc/self/uid_map, gid_map and IDs) with the plan. A difference
+// means the session is not the identity it claims, and it is refused.
+func verifyInsideIdentity(r *readyReply, cred Credential, plan idMapPlan) error {
+	if r == nil {
+		return &SetupError{Stage: StageHandshake, Message: "the session helper did not report its identity"}
+	}
+	uidMap, err1 := ParseIDMap([]byte(r.UIDMap))
+	gidMap, err2 := ParseIDMap([]byte(r.GIDMap))
+	if err := errors.Join(err1, err2); err != nil {
+		return &SetupError{Stage: StageUIDMap, Message: "the session reported unreadable ID maps", Err: err}
+	}
+	same := func(ids []uint32, want uint32) bool {
+		return len(ids) == 3 && ids[0] == want && ids[1] == want && ids[2] == want
+	}
+	if !equalMaps(uidMap, plan.uidMap) || !same(r.UIDs, cred.UID) {
+		return &SetupError{Stage: StageUIDMap, Message: fmt.Sprintf(
+			"UID mapping failed: inside the session uid_map is %q and the UIDs are %v, but %q and UID %d were planned",
+			strings.TrimSpace(uidMap.String()), r.UIDs, strings.TrimSpace(plan.uidMap.String()), cred.UID)}
+	}
+	if !equalMaps(gidMap, plan.gidMap) || !same(r.GIDs, cred.GID) {
+		return &SetupError{Stage: StageGIDMap, Message: fmt.Sprintf(
+			"GID mapping failed: inside the session gid_map is %q and the GIDs are %v, but %q and GID %d were planned",
+			strings.TrimSpace(gidMap.String()), r.GIDs, strings.TrimSpace(plan.gidMap.String()), cred.GID)}
+	}
+	return nil
+}
+
+// equalMaps compares maps as sets of lines; the kernel may reorder them.
+func equalMaps(a, b IDMap) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, r := range a {
+		found := false
+		for _, o := range b {
+			found = found || r == o
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }

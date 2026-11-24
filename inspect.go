@@ -161,6 +161,11 @@ type Report struct {
 	// may use; anything else is refused with a mapping error.
 	UIDRanges []IDRange `json:"uidRanges"`
 	GIDRanges []IDRange `json:"gidRanges"`
+	// ParentUIDRanges and ParentGIDRanges list the IDs of the caller's own
+	// namespace a session ID may map to: what Credential.ParentUID and
+	// ParentGID may name.
+	ParentUIDRanges []IDRange `json:"parentUIDRanges"`
+	ParentGIDRanges []IDRange `json:"parentGIDRanges"`
 	// Credential is the session credential cfg resolves to.
 	Credential *Credential `json:"credential,omitempty"`
 	// InheritsGroups reports that the session keeps the caller's

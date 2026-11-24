@@ -410,3 +410,94 @@ func TestUsableIDsMatchPlanner(t *testing.T) {
 		t.Fatalf("podman UIDs %v", got)
 	}
 }
+
+func ptr(v uint32) *uint32 { return &v }
+
+// TestPlanIDMapsManualParent covers the manual override of the immediate
+// parent namespace IDs: a session UID (the SSH target identity) stays
+// separate from the parent-namespace ID it maps to.
+func TestPlanIDMapsManualParent(t *testing.T) {
+	podman := identity{Caller: allCapsCaller(0, 0), ns: podmanNamespace()}
+	// Podman inside another namespace: Yuhaiin's map is relative to a
+	// parent that is not the host, so host IDs cannot be resolved.
+	deeper := identity{Caller: allCapsCaller(0, 0), ns: podmanNamespace()}
+	deeper.ns.Depth = 2
+	deeperNoFCAP := deeper
+	deeperNoFCAP.CapSetFCAP = false
+	deeperUser := identity{Caller: Caller{UID: 5, GID: 5}, ns: podmanNamespace()}
+	deeperUser.ns.Depth = 2
+	deeperDenied := deeper
+	deeperDenied.ns.SetgroupsAllowed = false
+	cases := []struct {
+		name      string
+		self      identity
+		cred      Credential
+		stage     Stage
+		message   string
+		uidLine   string
+		gidLines  []string
+		setGroups bool
+	}{
+		{name: "deeper: automatic host IDs are refused", self: deeper, cred: Credential{UID: 1009, GID: 1009}, stage: StageUIDMap, message: "nesting depth 2"},
+		{name: "deeper: manual parent 0 keeps the target identity", self: deeper, cred: Credential{UID: 1009, GID: 1009, ParentUID: ptr(0), ParentGID: ptr(0)},
+			uidLine: "1009 0 1", gidLines: []string{"1009 0 1"}},
+		{name: "deeper: manual parent of another namespace ID", self: deeper, cred: Credential{UID: 2000, GID: 2000, ParentUID: ptr(1000), ParentGID: ptr(1000)},
+			uidLine: "2000 1000 1", gidLines: []string{"2000 1000 1"}, setGroups: true},
+		{name: "deeper: parent ID not in the namespace", self: deeper, cred: Credential{UID: 1009, GID: 1009, ParentUID: ptr(70000), ParentGID: ptr(0)}, stage: StageUIDMap, message: "does not exist"},
+		{name: "deeper: parent GID not in the namespace", self: deeper, cred: Credential{UID: 1009, GID: 1009, ParentUID: ptr(0), ParentGID: ptr(70000)}, stage: StageGIDMap, message: "does not exist"},
+		{name: "deeper: only one override", self: deeper, cred: Credential{UID: 1009, GID: 0, ParentUID: ptr(0)}, uidLine: "1009 0 1", gidLines: []string{"0 0 1"}},
+		{name: "deeper: parent root without CAP_SETFCAP", self: deeperNoFCAP, cred: Credential{UID: 1009, GID: 1009, ParentUID: ptr(0), ParentGID: ptr(0)}, stage: StageUIDMap, message: "CAP_SETFCAP"},
+		{name: "deeper: other parent UID without CAP_SETUID", self: deeperUser, cred: Credential{UID: 1009, GID: 1009, ParentUID: ptr(0), ParentGID: ptr(5)}, stage: StageUIDMap, message: "CAP_SETUID"},
+		{name: "deeper: own parent IDs without capabilities", self: deeperUser, cred: Credential{UID: 1009, GID: 1009, ParentUID: ptr(5), ParentGID: ptr(5)}, uidLine: "1009 5 1", gidLines: []string{"1009 5 1"}},
+		{name: "deeper: other parent GID needs setgroups", self: deeperDenied, cred: Credential{UID: 1009, GID: 1009, ParentUID: ptr(1000), ParentGID: ptr(1000)}, stage: StageGIDMap, message: "setgroups"},
+		{name: "resolvable: agreeing override is redundant but accepted", self: podman, cred: Credential{UID: 1009, GID: 1009, ParentUID: ptr(0), ParentGID: ptr(0)}, uidLine: "1009 0 1", gidLines: []string{"1009 0 1"}},
+		{name: "resolvable: conflicting override is refused", self: podman, cred: Credential{UID: 1009, GID: 1009, ParentUID: ptr(5), ParentGID: ptr(0)}, stage: StageUIDMap, message: "is host UID 689828, not the session UID 1009"},
+		{name: "resolvable: override cannot rename an unmapped host ID", self: podman, cred: Credential{UID: 1000, GID: 1009, ParentUID: ptr(0), ParentGID: ptr(0)}, stage: StageUIDMap, message: "remove the override"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := planIDMaps(tc.self, tc.cred)
+			if tc.stage != "" {
+				var setup *SetupError
+				if !errors.As(err, &setup) || setup.Stage != tc.stage || !strings.Contains(setup.Message, tc.message) {
+					t.Fatalf("expected %s failure containing %q, got %v", tc.stage, tc.message, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.uidLines[0] != tc.uidLine || !slices.Equal(plan.gidLines, tc.gidLines) || plan.setGroups != tc.setGroups {
+				t.Fatalf("plan %+v", plan)
+			}
+		})
+	}
+	// Overrides are meaningless for rootful sessions, which have no map.
+	if _, err := rootfulCredential(deeper, Credential{UID: 1009, GID: 1009, ParentUID: ptr(0)}); err == nil {
+		t.Fatal("rootful credentials must refuse parent overrides")
+	}
+	if got := deeper.usableParentUIDs(); !slices.Equal(got, []IDRange{{0, 1}, {1, 65536}}) {
+		t.Fatalf("usable parent UIDs %v", got)
+	}
+}
+
+func TestVerifyInsideIdentity(t *testing.T) {
+	plan := idMapPlan{uidMap: IDMap{{1009, 0, 1}}, gidMap: IDMap{{1009, 0, 1}}}
+	cred := Credential{UID: 1009, GID: 1009}
+	good := &readyReply{UIDMap: "      1009          0          1\n", GIDMap: "1009 0 1\n", UIDs: []uint32{1009, 1009, 1009}, GIDs: []uint32{1009, 1009, 1009}}
+	if err := verifyInsideIdentity(good, cred, plan); err != nil {
+		t.Fatal(err)
+	}
+	for name, r := range map[string]*readyReply{
+		"identity map instead": {UIDMap: "1009 1009 1\n", GIDMap: "1009 0 1\n", UIDs: good.UIDs, GIDs: good.GIDs},
+		"wrong gid map":        {UIDMap: good.UIDMap, GIDMap: "1009 1 1\n", UIDs: good.UIDs, GIDs: good.GIDs},
+		"wrong uid":            {UIDMap: good.UIDMap, GIDMap: good.GIDMap, UIDs: []uint32{65534, 65534, 65534}, GIDs: good.GIDs},
+		"saved uid differs":    {UIDMap: good.UIDMap, GIDMap: good.GIDMap, UIDs: []uint32{1009, 1009, 0}, GIDs: good.GIDs},
+		"unreadable":           {UIDMap: "", GIDMap: good.GIDMap, UIDs: good.UIDs, GIDs: good.GIDs},
+		"missing":              nil,
+	} {
+		if err := verifyInsideIdentity(r, cred, plan); err == nil {
+			t.Errorf("%s: mismatch accepted", name)
+		}
+	}
+}

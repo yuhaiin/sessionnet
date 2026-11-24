@@ -135,6 +135,7 @@ func Inspect(ctx context.Context, cfg Config) Report {
 
 	if mode == ModeRootless {
 		r.UIDRanges, r.GIDRanges = self.usableUIDs(), self.usableGIDs()
+		r.ParentUIDRanges, r.ParentGIDRanges = self.usableParentUIDs(), self.usableParentGIDs()
 	}
 	cred, err := resolveCredential(mode, cfg.Credential, self)
 	if err == nil {

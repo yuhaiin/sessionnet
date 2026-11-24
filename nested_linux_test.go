@@ -335,3 +335,165 @@ func captureStdout(t *testing.T, out *strings.Builder, fn func() int) int {
 	_ = r.Close()
 	return code
 }
+
+// TestDeeperNamespaceManualParent runs sessions two user namespaces deep:
+// test user -> A (uid_map "0 <uid> 1", like Podman) -> B (uid_map "0 0 1").
+// From B the host IDs cannot be resolved, so explicit host IDs are refused,
+// while a manual parent override (session UID <uid> -> B's UID 0) yields the
+// child map "<uid> 0 1" and host file access as the test user.
+func TestDeeperNamespaceManualParent(t *testing.T) {
+	requireRootless(t)
+	if ns, err := CurrentUserNamespace(); err != nil || !ns.Initial {
+		t.Skip("builds its own two-level hierarchy from the initial namespace")
+	}
+	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
+	dir := t.TempDir()
+	prepareAccessDir(t, dir)
+	denied := ""
+	if info, err := os.Stat("/root"); err == nil && info.Mode().Perm()&0o007 == 0 {
+		denied = "/root"
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), "SESSIONNET_TEST_MODE=nest-deeper", "SESSIONNET_TEST_DIR="+dir, "SESSIONNET_DENIED_DIR="+denied,
+		fmt.Sprintf("SESSIONNET_EXPECT_HOST_UID=%d", uid), fmt.Sprintf("SESSIONNET_EXPECT_HOST_GID=%d", gid))
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags:  syscall.CLONE_NEWUSER,
+		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: int(uid), Size: 1}},
+		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: int(gid), Size: 1}},
+	}
+	output, err := cmd.CombinedOutput()
+	checkManualParent(t, scenarioFromOutput(t, output, err), uid, gid, 2, false, denied != "")
+	checkHostOwnership(t, dir, uid, gid)
+}
+
+func checkManualParent(t *testing.T, r scenarioResult, uid, gid uint32, depth int, groupDir, denied bool) {
+	t.Helper()
+	if !r.OK {
+		t.Fatalf("deeper scenario failed: %+v", r)
+	}
+	v := parseKeyValues(r.Output)
+	if v["depth"] != strconv.Itoa(depth) || v["hostids"] != "false" {
+		t.Fatalf("namespace B: %s", r.Output)
+	}
+	if !strings.Contains(v["automatic"], fmt.Sprintf("nesting depth %d", depth)) {
+		t.Errorf("explicit host IDs must be refused without a resolvable host: %q", v["automatic"])
+	}
+	if !strings.Contains(v["unmapped"], "does not exist") {
+		t.Errorf("a parent ID outside B must be refused: %q", v["unmapped"])
+	}
+	_, session, _ := strings.Cut(r.Output, "SESSION\n")
+	checkFileAccess(t, "manual parent", session, uid, gid, groupDir, denied)
+	if want, got := fmt.Sprintf("%d %s 1", uid, parentEnv("SESSIONNET_PARENT_UID")), parseKeyValues(session)["uidmap"]; got != want {
+		t.Errorf("session uid_map %q, want %q", got, want)
+	}
+	if want, got := fmt.Sprintf("%d %s 1", gid, parentEnv("SESSIONNET_PARENT_GID")), parseKeyValues(session)["gidmap"]; got != want {
+		t.Errorf("session gid_map %q, want %q", got, want)
+	}
+}
+
+// parentEnv is the manual parent namespace ID under test (default 0, root
+// of the namespace the test runs in).
+func parentEnv(name string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return "0"
+}
+
+// TestDeeperNamespaceInPlace runs the manual-parent checks when the test
+// binary itself was started two or more namespaces deep, for example
+// `podman unshare unshare --user --map-root-user ./sessionnet.test`.
+func TestDeeperNamespaceInPlace(t *testing.T) {
+	ns, err := CurrentUserNamespace()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ns.Initial || ns.Depth == 1 {
+		if os.Getenv("SESSIONNET_REQUIRE_DEEPER") == "1" {
+			t.Fatalf("the test must run two or more user namespaces deep (depth %d)", ns.Depth)
+		}
+		t.Skip("not running in a deeper user namespace")
+	}
+	requireRootless(t)
+	uid, err1 := strconv.ParseUint(os.Getenv("SESSIONNET_EXPECT_HOST_UID"), 10, 32)
+	gid, err2 := strconv.ParseUint(os.Getenv("SESSIONNET_EXPECT_HOST_GID"), 10, 32)
+	if err1 != nil || err2 != nil {
+		t.Fatal("set SESSIONNET_EXPECT_HOST_UID and SESSIONNET_EXPECT_HOST_GID to the target identity")
+	}
+	dir := os.Getenv("SESSIONNET_TEST_DIR")
+	if dir == "" {
+		dir = t.TempDir()
+		_ = os.Setenv("SESSIONNET_TEST_DIR", dir)
+	}
+	prepareAccessDir(t, dir)
+	var out strings.Builder
+	if code := captureStdout(t, &out, runManualParent); code != 0 {
+		t.Fatalf("scenario exited %d", code)
+	}
+	r := scenarioFromOutput(t, []byte(out.String()), nil)
+	t.Logf("namespace depth %d, uid_map %q\n%s", ns.Depth, ns.UIDMap.String(), r.Output)
+	checkManualParent(t, r, uint32(uid), uint32(gid), ns.Depth, os.Getenv("SESSIONNET_GROUP_DIR") != "", os.Getenv("SESSIONNET_DENIED_DIR") != "")
+	// In this namespace the files belong to the manual parent IDs.
+	puid, _ := strconv.ParseUint(parentEnv("SESSIONNET_PARENT_UID"), 10, 32)
+	pgid, _ := strconv.ParseUint(parentEnv("SESSIONNET_PARENT_GID"), 10, 32)
+	checkHostOwnership(t, dir, uint32(puid), uint32(pgid))
+}
+
+// runNestDeeper is namespace A: it creates B (mapping A's root to itself)
+// and runs the manual-parent scenario there.
+func runNestDeeper() int {
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), "SESSIONNET_TEST_MODE=manual-parent")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags:  syscall.CLONE_NEWUSER,
+		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: 0, Size: 1}},
+		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: 0, Size: 1}},
+	}
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return report(fmt.Errorf("create namespace B: %w", err), "")
+	}
+	return 0
+}
+
+func runManualParent() int {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	hostUID, err1 := strconv.ParseUint(os.Getenv("SESSIONNET_EXPECT_HOST_UID"), 10, 32)
+	hostGID, err2 := strconv.ParseUint(os.Getenv("SESSIONNET_EXPECT_HOST_GID"), 10, 32)
+	if err1 != nil || err2 != nil {
+		return report(fmt.Errorf("expected host identity missing"), "")
+	}
+	ns, err := CurrentUserNamespace()
+	if err != nil {
+		return report(err, "")
+	}
+	var out strings.Builder
+	fmt.Fprintf(&out, "depth=%d\nhostids=%v\n", ns.Depth, ns.HostIDs())
+	target := Credential{UID: uint32(hostUID), GID: uint32(hostGID)}
+	if err := Probe(ctx, Config{Credential: &target}); err != nil {
+		fmt.Fprintf(&out, "automatic=%s\n", strings.ReplaceAll(err.Error(), "\n", " "))
+	} else {
+		out.WriteString("automatic=accepted\n")
+	}
+	bad := target
+	bad.ParentUID, bad.ParentGID = ptr(7), ptr(0)
+	if err := Probe(ctx, Config{Credential: &bad}); err != nil {
+		fmt.Fprintf(&out, "unmapped=%s\n", strings.ReplaceAll(err.Error(), "\n", " "))
+	} else {
+		out.WriteString("unmapped=accepted\n")
+	}
+	manual := target
+	puid, err1 := strconv.ParseUint(parentEnv("SESSIONNET_PARENT_UID"), 10, 32)
+	pgid, err2 := strconv.ParseUint(parentEnv("SESSIONNET_PARENT_GID"), 10, 32)
+	if err1 != nil || err2 != nil {
+		return report(fmt.Errorf("invalid parent IDs"), "")
+	}
+	manual.ParentUID, manual.ParentGID = ptr(uint32(puid)), ptr(uint32(pgid))
+	text, err := runSessionScript(ctx, Config{Credential: &manual}, fileAccessScript(os.Getenv("SESSIONNET_TEST_DIR"), os.Getenv("SESSIONNET_GROUP_DIR"), os.Getenv("SESSIONNET_DENIED_DIR")))
+	if err != nil {
+		return report(err, out.String())
+	}
+	out.WriteString("SESSION\n" + text)
+	return report(nil, out.String())
+}
