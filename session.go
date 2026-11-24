@@ -132,11 +132,18 @@ func (m Mode) Resolve() (Mode, error) {
 	}
 }
 
-// Credential names a non-root Unix user. In rootful mode, and in rootless
-// mode when the caller may call setgroups(2) for the session (it is root, or
-// newgidmap mapped the group), supplementary groups are replaced with Groups.
-// Otherwise the kernel forbids setgroups in the user namespace, the session
-// inherits the caller's supplementary groups and Groups must be empty.
+// Credential names the Unix identity of session processes by host IDs: IDs
+// of the initial user namespace, also when the caller runs inside a user
+// namespace (see README "Credentials"). When the caller's namespace cannot
+// be resolved to the host, they are IDs of the caller's namespace and only
+// the caller's own identity is accepted. Unmappable IDs are rejected.
+//
+// A rootless session with the caller's own identity and no Groups keeps the
+// caller's supplementary groups. Otherwise, in rootful mode and in rootless
+// mode when the caller may call setgroups(2) for the session (CAP_SETGID in
+// a namespace that allows it, or newgidmap), supplementary groups are
+// replaced with Groups; if not, Groups must be empty and the caller's groups
+// are inherited.
 type Credential struct {
 	UID    uint32
 	GID    uint32

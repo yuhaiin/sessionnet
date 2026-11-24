@@ -32,6 +32,9 @@ func init() {
 	if len(os.Args) >= 2 && os.Args[1] == helperArg {
 		os.Exit(helperMain(os.Args[2:]))
 	}
+	if len(os.Args) == 2 && os.Args[0] == helperArgv0 && os.Args[1] == helperLevelArg {
+		os.Exit(nestingLevelMain())
+	}
 }
 
 func helperMain(args []string) int {

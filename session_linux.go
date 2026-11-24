@@ -25,18 +25,21 @@ var ErrSupervisorExited = errors.New("sessionnet: session supervisor exited")
 // then Release. If packet processing cannot be initialized, Close the
 // session without releasing it.
 type Session struct {
-	mode    Mode
-	helper  *exec.Cmd
-	ctl     *controlConn
-	tun     *os.File
-	diag    *os.File
-	netns   *os.File
-	name    string
-	cred    Credential
-	cgroup  *sessionCgroup
-	ctx     context.Context
-	initial *Config
-	timings SetupTimings
+	mode   Mode
+	helper *exec.Cmd
+	ctl    *controlConn
+	tun    *os.File
+	diag   *os.File
+	netns  *os.File
+	name   string
+	cred   Credential
+	// uidMap and gidMap translate session IDs into the caller's namespace;
+	// nil in rootful mode, whose session runs in the caller's namespace.
+	uidMap, gidMap IDMap
+	cgroup         *sessionCgroup
+	ctx            context.Context
+	initial        *Config
+	timings        SetupTimings
 
 	helperDone chan struct{}
 	readerDone chan struct{}
@@ -80,12 +83,12 @@ func validate(c Config, mode Mode, cred Credential) error {
 }
 
 // resolveCredential applies the rootless default of running as the caller.
-func resolveCredential(mode Mode, cred *Credential) (Credential, error) {
+func resolveCredential(mode Mode, cred *Credential, self identity) (Credential, error) {
 	if cred == nil {
 		if mode == ModeRootful {
 			return Credential{}, errors.New("sessionnet: rootful mode requires an explicit credential")
 		}
-		return Credential{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}, nil
+		return self.defaultCredential(), nil
 	}
 	return Credential{UID: cred.UID, GID: cred.GID, Groups: append([]uint32{}, cred.Groups...)}, nil
 }
@@ -100,7 +103,11 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	if err != nil {
 		return nil, err
 	}
-	cred, err := resolveCredential(mode, cfg.Credential)
+	self, err := currentIdentity()
+	if err != nil {
+		return nil, err
+	}
+	cred, err := resolveCredential(mode, cfg.Credential, self)
 	if err != nil {
 		return nil, err
 	}
@@ -114,11 +121,17 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// adopt holds the IDs the helper switches to in its own namespace: the
+	// session IDs in a rootless session's new user namespace, or their
+	// caller-namespace counterparts in rootful mode.
 	var plan idMapPlan
+	adopt := cred
 	if mode == ModeRootless {
-		if plan, err = planIDMaps(currentIdentity(), cred); err != nil {
+		if plan, err = planIDMaps(self, cred); err != nil {
 			return nil, err
 		}
+	} else if adopt, err = rootfulCredential(self, cred); err != nil {
+		return nil, err
 	}
 	mtu := cfg.MTU
 	if mtu == 0 {
@@ -177,6 +190,7 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	spawned := time.Now()
 	s := &Session{
 		mode: mode, helper: helper, ctl: ctl, name: DefaultInterface, cred: cred, cgroup: group, ctx: ctx,
+		uidMap: plan.uidMap, gidMap: plan.gidMap,
 		helperDone: make(chan struct{}), readerDone: make(chan struct{}), procs: make(map[uint64]*Process),
 	}
 	go func() {
@@ -206,7 +220,7 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	mapped := time.Now()
 	s.timings.IDMap = mapped.Sub(spawned)
 	init := &initRequest{
-		Mode: mode, UID: cred.UID, GID: cred.GID, Groups: cred.Groups, SetGroups: plan.setGroups || mode == ModeRootful,
+		Mode: mode, UID: adopt.UID, GID: adopt.GID, Groups: adopt.Groups, SetGroups: plan.setGroups || mode == ModeRootful,
 		Interface: s.name, MTU: mtu, IPv6: cfg.IPv6, IsolateDNS: cfg.IsolateDNS,
 		SessionIPv4: addresses.SessionIPv4.String(), GatewayIPv4: addresses.GatewayIPv4.String(),
 	}
@@ -366,7 +380,8 @@ func (s *Session) DupTun() (*os.File, error) {
 // DupDiag returns a duplicate of a NETLINK_SOCK_DIAG socket that was created
 // inside the session network namespace. Queries on it see only the session's
 // sockets, so process lookup never needs setns. UIDs are reported in the
-// session user namespace, which uses identity mappings.
+// session's user namespace; UIDToCaller translates them into the caller's,
+// in which /proc shows process owners.
 func (s *Session) DupDiag() (*os.File, error) { return s.dup(s.diag, "sock_diag") }
 
 // DupNetNS returns a duplicate of the session's network namespace handle.
@@ -400,9 +415,19 @@ func (s *Session) PID() int { return s.helper.Process.Pid }
 // Mode reports how the session namespaces were created.
 func (s *Session) Mode() Mode { return s.mode }
 
-// Credential returns the IDs every session process runs as.
+// Credential returns the session IDs every session process runs as.
 func (s *Session) Credential() Credential {
 	return Credential{UID: s.cred.UID, GID: s.cred.GID, Groups: append([]uint32{}, s.cred.Groups...)}
+}
+
+// UIDToCaller translates a UID of the session's user namespace, such as a
+// socket owner reported by DupDiag, into the caller's user namespace. It
+// reports false for UIDs the session does not map.
+func (s *Session) UIDToCaller(id uint32) (uint32, bool) {
+	if s.uidMap == nil {
+		return id, true
+	}
+	return s.uidMap.ToParent(id)
 }
 
 // Signal forwards a signal to the initial command. The supervisor only

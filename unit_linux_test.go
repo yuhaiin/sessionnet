@@ -4,10 +4,10 @@ package sessionnet
 
 import (
 	"errors"
-	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -65,60 +65,146 @@ func TestModeResolve(t *testing.T) {
 }
 
 func TestResolveCredential(t *testing.T) {
-	got, err := resolveCredential(ModeRootless, nil)
-	if err != nil || got.UID != uint32(os.Geteuid()) || got.GID != uint32(os.Getegid()) {
-		t.Fatalf("rootless default credential: %+v %v", got, err)
+	self := identity{Caller: Caller{UID: 0, GID: 0}, ns: podmanNamespace()}
+	got, err := resolveCredential(ModeRootless, nil, self)
+	if err != nil || got.UID != 1009 || got.GID != 1009 {
+		t.Fatalf("rootless default credential must be the caller's host identity: %+v %v", got, err)
 	}
-	if _, err := resolveCredential(ModeRootful, nil); err == nil {
+	if _, err := resolveCredential(ModeRootful, nil, self); err == nil {
 		t.Fatal("rootful mode requires an explicit credential")
+	}
+	explicit := &Credential{UID: 5, GID: 6, Groups: []uint32{7}}
+	got, err = resolveCredential(ModeRootless, explicit, self)
+	if err != nil || got.UID != 5 || got.GID != 6 || len(got.Groups) != 1 {
+		t.Fatalf("explicit credential: %+v %v", got, err)
+	}
+	got.Groups[0] = 8
+	if explicit.Groups[0] != 7 {
+		t.Fatal("the resolved credential must not alias the caller's slice")
 	}
 }
 
+func initialNamespace() UserNamespace {
+	return UserNamespace{Initial: true, UIDMap: IdentityIDMap(), GIDMap: IdentityIDMap(), SetgroupsAllowed: true}
+}
+
+// podmanNamespace is the namespace `podman unshare` creates for host user
+// 1009 with /etc/subuid and /etc/subgid "example-user:689824:65536".
+func podmanNamespace() UserNamespace {
+	m := IDMap{{0, 1009, 1}, {1, 689824, 65536}}
+	return UserNamespace{Depth: 1, UIDMap: m, GIDMap: m, SetgroupsAllowed: true}
+}
+
+func allCapsCaller(uid, gid uint32) Caller {
+	return Caller{UID: uid, GID: gid, CapSetUID: true, CapSetGID: true, CapSetFCAP: true, CapSysAdm: true, CapNetAdm: true}
+}
+
 func TestPlanIDMaps(t *testing.T) {
-	user := identity{uid: 1000, gid: 1000, username: "alice"}
+	user := identity{Caller: Caller{UID: 1000, GID: 1000}, ns: initialNamespace(), username: "alice"}
 	withSub := user
 	withSub.subUIDs, withSub.subGIDs = []idRange{{100000, 65536}}, []idRange{{100000, 65536}}
 	withSub.newuidmap, withSub.newgidm = "/usr/bin/newuidmap", "/usr/bin/newgidmap"
-	root := identity{canSetUID: true, canSetGID: true}
+	root := identity{Caller: allCapsCaller(0, 0), ns: initialNamespace()}
+	podman := identity{Caller: allCapsCaller(0, 0), ns: podmanNamespace()}
+	podmanNoFCAP := podman
+	podmanNoFCAP.CapSetFCAP = false
+	podmanDenied := podman
+	podmanDenied.ns.SetgroupsAllowed = false
+	// Rootless podman with its subordinate range, but Yuhaiin running as a
+	// non-root user of it without capabilities.
+	podmanUser := identity{Caller: Caller{UID: 1000, GID: 1000}, ns: podmanNamespace()}
+	nested := identity{Caller: allCapsCaller(0, 0), ns: podmanNamespace()}
+	nested.ns.Depth = 2
+	unknown := nested
+	unknown.ns.Depth, unknown.ns.DepthError = -1, "probe failed"
 	cases := []struct {
 		name      string
 		self      identity
 		cred      Credential
 		stage     Stage
+		uidLine   string
+		gidLines  []string
 		uidTool   bool
 		gidTool   bool
 		setGroups bool
-		gidLines  int
+		message   string
 	}{
-		{"own IDs map directly and keep groups", user, Credential{UID: 1000, GID: 1000}, "", false, false, false, 1},
-		{"other UID without newuidmap", user, Credential{UID: 1001, GID: 1000}, StageUIDMap, false, false, false, 0},
-		{"other GID without newgidmap", user, Credential{UID: 1000, GID: 1001}, StageGIDMap, false, false, false, 0},
-		{"groups need setgroups", user, Credential{UID: 1000, GID: 1000, Groups: []uint32{27}}, StageGIDMap, false, false, false, 0},
-		{"subordinate UID uses newuidmap", withSub, Credential{UID: 100005, GID: 1000}, "", true, false, false, 1},
-		{"subordinate GID uses newgidmap", withSub, Credential{UID: 1000, GID: 100005}, "", false, true, true, 1},
-		{"subordinate UID outside range", withSub, Credential{UID: 200000, GID: 1000}, StageUIDMap, false, false, false, 0},
-		{"privileged caller maps any ID and groups", root, Credential{UID: 65534, GID: 65534, Groups: []uint32{100, 65534}}, "", false, false, true, 2},
+		{name: "native own IDs keep groups", self: user, cred: Credential{UID: 1000, GID: 1000}, uidLine: "1000 1000 1", gidLines: []string{"1000 1000 1"}},
+		{name: "native other UID without newuidmap", self: user, cred: Credential{UID: 1001, GID: 1000}, stage: StageUIDMap, message: "Yuhaiin user (UID 1000) only"},
+		{name: "native other GID without newgidmap", self: user, cred: Credential{UID: 1000, GID: 1001}, stage: StageGIDMap},
+		{name: "native groups need setgroups", self: user, cred: Credential{UID: 1000, GID: 1000, Groups: []uint32{27}}, stage: StageGIDMap},
+		{name: "native subordinate UID uses newuidmap", self: withSub, cred: Credential{UID: 100005, GID: 1000}, uidLine: "100005 100005 1", gidLines: []string{"1000 1000 1"}, uidTool: true},
+		{name: "native subordinate GID uses newgidmap", self: withSub, cred: Credential{UID: 1000, GID: 100005}, uidLine: "1000 1000 1", gidLines: []string{"100005 100005 1"}, gidTool: true, setGroups: true},
+		{name: "native subordinate UID outside range", self: withSub, cred: Credential{UID: 200000, GID: 1000}, stage: StageUIDMap},
+		{name: "native root maps any ID and replaces groups", self: root, cred: Credential{UID: 65534, GID: 65534, Groups: []uint32{100, 65534}}, uidLine: "65534 65534 1", gidLines: []string{"65534 65534 1", "100 100 1"}, setGroups: true},
+		{name: "native root keeps its own groups", self: root, cred: Credential{UID: 0, GID: 0}, uidLine: "0 0 1", gidLines: []string{"0 0 1"}},
+
+		// The reported bug: host UID 1009 is namespace UID 0, not 1009.
+		{name: "podman host identity maps to namespace root", self: podman, cred: Credential{UID: 1009, GID: 1009}, uidLine: "1009 0 1", gidLines: []string{"1009 0 1"}},
+		{name: "podman subordinate host ID", self: podman, cred: Credential{UID: 689824, GID: 689824}, uidLine: "689824 1 1", gidLines: []string{"689824 1 1"}, setGroups: true},
+		{name: "podman supplementary groups translated", self: podman, cred: Credential{UID: 1009, GID: 1009, Groups: []uint32{689900}}, uidLine: "1009 0 1", gidLines: []string{"1009 0 1", "689900 77 1"}, setGroups: true},
+		{name: "podman unmapped host UID", self: podman, cred: Credential{UID: 1000, GID: 1009}, stage: StageUIDMap, message: "host UID 1000 is not mapped"},
+		{name: "podman unmapped host GID", self: podman, cred: Credential{UID: 1009, GID: 100}, stage: StageGIDMap, message: "host GID 100 is not mapped"},
+		{name: "podman unmapped supplementary group", self: podman, cred: Credential{UID: 1009, GID: 1009, Groups: []uint32{100}}, stage: StageGIDMap, message: "host GID 100"},
+		{name: "podman host root is unmapped", self: podman, cred: Credential{UID: 0, GID: 0}, stage: StageUIDMap, message: "host UID 0 is not mapped"},
+		{name: "podman root without CAP_SETFCAP", self: podmanNoFCAP, cred: Credential{UID: 1009, GID: 1009}, stage: StageUIDMap, message: "CAP_SETFCAP"},
+		{name: "podman subordinate without CAP_SETFCAP", self: podmanNoFCAP, cred: Credential{UID: 689824, GID: 1009}, uidLine: "689824 1 1", gidLines: []string{"1009 0 1"}, setGroups: true},
+		{name: "podman setgroups denied keeps own groups", self: podmanDenied, cred: Credential{UID: 1009, GID: 1009}, uidLine: "1009 0 1", gidLines: []string{"1009 0 1"}},
+		{name: "podman setgroups denied rejects groups", self: podmanDenied, cred: Credential{UID: 1009, GID: 1009, Groups: []uint32{689900}}, stage: StageGIDMap, message: "setgroups"},
+		{name: "podman setgroups denied rejects other GID", self: podmanDenied, cred: Credential{UID: 1009, GID: 689900}, stage: StageGIDMap, message: "setgroups"},
+		{name: "podman unprivileged user own identity", self: podmanUser, cred: Credential{UID: 690823, GID: 690823}, uidLine: "690823 1000 1", gidLines: []string{"690823 1000 1"}},
+		{name: "podman unprivileged user other UID", self: podmanUser, cred: Credential{UID: 1009, GID: 690823}, stage: StageUIDMap, message: "CAP_SETUID"},
+
+		{name: "nested twice own identity", self: nested, cred: Credential{UID: 0, GID: 0}, uidLine: "0 0 1", gidLines: []string{"0 0 1"}},
+		{name: "nested twice rejects host IDs", self: nested, cred: Credential{UID: 1009, GID: 1009}, stage: StageUIDMap, message: "nesting depth 2"},
+		{name: "unknown depth rejects other IDs", self: unknown, cred: Credential{UID: 0, GID: 5}, stage: StageGIDMap, message: "probe failed"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			plan, err := planIDMaps(tc.self, tc.cred)
 			if tc.stage != "" {
 				var setup *SetupError
-				if !errors.As(err, &setup) || setup.Stage != tc.stage {
-					t.Fatalf("expected %s failure, got %v", tc.stage, err)
+				if !errors.As(err, &setup) || setup.Stage != tc.stage || !strings.Contains(setup.Message, tc.message) {
+					t.Fatalf("expected %s failure containing %q, got %v", tc.stage, tc.message, err)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			if (plan.uidTool != "") != tc.uidTool || (plan.gidTool != "") != tc.gidTool || plan.setGroups != tc.setGroups || len(plan.gidLines) != tc.gidLines {
+			if (plan.uidTool != "") != tc.uidTool || (plan.gidTool != "") != tc.gidTool || plan.setGroups != tc.setGroups ||
+				len(plan.uidLines) != 1 || plan.uidLines[0] != tc.uidLine || !slices.Equal(plan.gidLines, tc.gidLines) {
 				t.Fatalf("plan %+v", plan)
 			}
-			if want := fmt.Sprintf("%d %d 1", tc.cred.UID, tc.cred.UID); plan.uidLines[0] != want {
-				t.Fatalf("mappings must be identity mappings: %v", plan.uidLines)
+			if inside, _ := plan.uidMap.FromParent(mustParseLine(t, tc.uidLine)); inside != tc.cred.UID {
+				t.Fatalf("uidMap %v does not translate back to %d", plan.uidMap, tc.cred.UID)
 			}
 		})
+	}
+}
+
+func mustParseLine(t *testing.T, line string) uint32 {
+	t.Helper()
+	m := mustParse(t, line)
+	return m[0].ParentID
+}
+
+func TestRootfulCredential(t *testing.T) {
+	podman := identity{Caller: allCapsCaller(0, 0), ns: podmanNamespace()}
+	got, err := rootfulCredential(podman, Credential{UID: 690823, GID: 690823, Groups: []uint32{689900}})
+	if err != nil || got.UID != 1000 || got.GID != 1000 || !slices.Equal(got.Groups, []uint32{77}) {
+		t.Fatalf("rootful credential in podman: %+v %v", got, err)
+	}
+	// Host 1009 is the namespace root: rootful sessions must not run as it.
+	if _, err := rootfulCredential(podman, Credential{UID: 1009, GID: 1009}); err == nil || !strings.Contains(err.Error(), "root of the user namespace") {
+		t.Fatalf("namespace root must be refused: %v", err)
+	}
+	if _, err := rootfulCredential(podman, Credential{UID: 1000, GID: 1000}); err == nil {
+		t.Fatal("unmapped host IDs must be refused")
+	}
+	native := identity{Caller: allCapsCaller(0, 0), ns: initialNamespace()}
+	if got, err := rootfulCredential(native, Credential{UID: 1000, GID: 1000}); err != nil || got.UID != 1000 {
+		t.Fatalf("native rootful credential: %+v %v", got, err)
 	}
 }
 
@@ -285,5 +371,42 @@ func TestAppArmorUsernsMessageNamesExecutable(t *testing.T) {
 	msg := appArmorUsernsMessage()
 	if !strings.Contains(msg, "apparmor_restrict_unprivileged_userns=1") || !strings.Contains(msg, "userns,") || !strings.Contains(msg, exe) {
 		t.Fatalf("AppArmor message lacks the remedy: %s", msg)
+	}
+}
+
+// TestUsableIDsMatchPlanner checks that the advertised ranges agree with
+// what planIDMaps accepts, for every probed ID.
+func TestUsableIDsMatchPlanner(t *testing.T) {
+	podman := identity{Caller: allCapsCaller(0, 0), ns: podmanNamespace()}
+	podmanNoFCAP := podman
+	podmanNoFCAP.CapSetFCAP = false
+	podmanDenied := podman
+	podmanDenied.ns.SetgroupsAllowed = false
+	user := identity{Caller: Caller{UID: 1000, GID: 1000}, ns: initialNamespace(), username: "alice",
+		subUIDs: []idRange{{100000, 10}}, subGIDs: []idRange{{200000, 10}}, newuidmap: "/x", newgidm: "/x"}
+	nested := podman
+	nested.ns.Depth = 2
+	probes := []uint32{0, 1, 99, 100, 999, 1000, 1001, 1008, 1009, 1010, 99999, 100000, 100009, 100010, 199999, 200000,
+		200009, 200010, 689823, 689824, 690000, 755359, 755360, 4294967294}
+	for name, self := range map[string]identity{"podman": podman, "podman without CAP_SETFCAP": podmanNoFCAP,
+		"podman setgroups denied": podmanDenied, "native user": user, "nested twice": nested} {
+		uids, gids := self.usableUIDs(), self.usableGIDs()
+		inRange := func(ranges []IDRange, id uint32) bool {
+			return slices.ContainsFunc(ranges, func(r IDRange) bool { return r.Contains(id) })
+		}
+		own := self.defaultCredential()
+		for _, id := range probes {
+			_, err := planIDMaps(self, Credential{UID: id, GID: own.GID})
+			if (err == nil) != inRange(uids, id) {
+				t.Errorf("%s: UID %d: planner error %v, advertised %v", name, id, err, uids)
+			}
+			_, err = planIDMaps(self, Credential{UID: uids[0].Start, GID: id})
+			if (err == nil) != inRange(gids, id) {
+				t.Errorf("%s: GID %d: planner error %v, advertised %v", name, id, err, gids)
+			}
+		}
+	}
+	if got := podman.usableUIDs(); !slices.Equal(got, []IDRange{{1009, 1}, {689824, 65536}}) {
+		t.Fatalf("podman UIDs %v", got)
 	}
 }
