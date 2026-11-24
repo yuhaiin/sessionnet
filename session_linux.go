@@ -58,12 +58,16 @@ func validate(c Config, mode Mode, cred Credential) error {
 	if c.Command != nil && (len(c.Command) == 0 || strings.TrimSpace(c.Command[0]) == "") {
 		return errors.New("sessionnet: command must not be empty")
 	}
-	if cred.UID == 0 || cred.GID == 0 {
-		return errors.New("sessionnet: an unprivileged uid/gid is required")
-	}
-	for _, group := range cred.Groups {
-		if group == 0 {
-			return errors.New("sessionnet: supplementary root group is forbidden")
+	// Rootless sessions may keep the caller's root identity: the user namespace
+	// cannot grant more than the caller already holds.
+	if mode == ModeRootful {
+		if cred.UID == 0 || cred.GID == 0 {
+			return errors.New("sessionnet: rootful mode requires an unprivileged uid/gid")
+		}
+		for _, group := range cred.Groups {
+			if group == 0 {
+				return errors.New("sessionnet: supplementary root group is forbidden in rootful mode")
+			}
 		}
 	}
 	if c.MTU != 0 && (c.MTU < 1280 || c.MTU > 9000) {
