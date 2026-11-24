@@ -19,7 +19,7 @@ import (
 // dropped its privileges, because session processes run as the same user.
 const (
 	maxMessageSize = 256 << 10
-	maxMessageFDs  = 3
+	maxMessageFDs  = 3 + MaxLoopbackForwards
 
 	opInit    = "init"
 	opReady   = "ready"
@@ -58,8 +58,10 @@ type initRequest struct {
 	SessionIPv4 string   `json:"sessionIPv4"`
 	GatewayIPv4 string   `json:"gatewayIPv4"`
 	SessionIPv6 string   `json:"sessionIPv6,omitempty"`
-	GatewayIPv6 string   `json:"gatewayIPv6,omitempty"`
-	IsolateDNS  bool     `json:"isolateDNS"`
+	// LoopbackForwards are revalidated by the helper before use.
+	LoopbackForwards []wireLoopbackForward `json:"loopbackForwards,omitempty"`
+	GatewayIPv6      string                `json:"gatewayIPv6,omitempty"`
+	IsolateDNS       bool                  `json:"isolateDNS"`
 }
 
 // readyReply carries the TUN, sock_diag and network namespace descriptors.
@@ -77,6 +79,11 @@ type readyReply struct {
 	GIDMap string   `json:"gidMap,omitempty"`
 	UIDs   []uint32 `json:"uids,omitempty"`
 	GIDs   []uint32 `json:"gids,omitempty"`
+}
+
+type wireLoopbackForward struct {
+	Network string `json:"network"`
+	Address string `json:"address"`
 }
 
 type spawnRequest struct {

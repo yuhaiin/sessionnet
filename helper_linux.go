@@ -121,6 +121,11 @@ func setupSession(conn *controlConn, req *initRequest) error {
 	if err := enableLoopback(h); err != nil {
 		return err
 	}
+	loopback, err := createLoopbackSockets(req)
+	if err != nil {
+		return err
+	}
+	defer closeFiles(loopback)
 	tun, err := createTun(req.Interface)
 	if err != nil {
 		return err
@@ -143,12 +148,13 @@ func setupSession(conn *controlConn, req *initRequest) error {
 	}
 	defer netns.Close()
 	elapsed(&reply.Diagnostics)
-	if err := conn.send(&message{Op: opReady, Ready: reply}, tun, diag, netns); err != nil {
+	if err := conn.send(&message{Op: opReady, Ready: reply}, append([]*os.File{tun, diag, netns}, loopback...)...); err != nil {
 		return fail(StageHandshake, "cannot hand the TUN descriptor to the supervisor", err)
 	}
 	_ = tun.Close()
 	_ = diag.Close()
 	_ = netns.Close()
+	closeFiles(loopback)
 	return dropPrivilegesAndSupervise(conn, req)
 }
 

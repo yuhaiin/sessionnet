@@ -197,6 +197,9 @@ type Config struct {
 	// every descendant when the session closes; the cgroup additionally lets
 	// a restarted supervisor reap sessions orphaned by a crash.
 	Cgroup *CgroupManager
+	// LoopbackForwards reserve session loopback endpoints for the caller
+	// (see LoopbackForward). Empty leaves the session loopback untouched.
+	LoopbackForwards []LoopbackForward
 	// HelperPath is the executable re-executed as the session helper. It
 	// defaults to /proc/self/exe; see the package documentation.
 	HelperPath string
@@ -235,11 +238,13 @@ const (
 	StageResolver      Stage = "resolver"
 	StageTUN           Stage = "tun"
 	StageNetwork       Stage = "network"
-	StageDiagnostics   Stage = "diagnostics"
-	StagePrivileges    Stage = "privileges"
-	StageCgroup        Stage = "cgroup"
-	StageHelper        Stage = "helper"
-	StageHandshake     Stage = "handshake"
+	// StageLoopbackForward covers the sockets of LoopbackForwards.
+	StageLoopbackForward Stage = "loopback-forward"
+	StageDiagnostics     Stage = "diagnostics"
+	StagePrivileges      Stage = "privileges"
+	StageCgroup          Stage = "cgroup"
+	StageHelper          Stage = "helper"
+	StageHandshake       Stage = "handshake"
 )
 
 // SetupError reports why a session could not be created. Message is a
