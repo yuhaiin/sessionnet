@@ -176,6 +176,42 @@ them). `Session.UIDToCaller` translates socket owners reported by `DupDiag`
 Session processes have no capabilities, an empty bounding set and
 `no_new_privs`; setuid programs do not gain privilege.
 
+## Loopback forwards
+
+`Config.LoopbackForwards` reserves loopback endpoints of the session for the
+caller, for example to let session processes reach services on the
+caller's own loopback without changing what they connect to:
+
+```go
+s, err := sessionnet.Open(ctx, sessionnet.Config{IPv6: true, LoopbackForwards: []sessionnet.LoopbackForward{
+	{Network: "tcp", Address: netip.MustParseAddrPort("127.0.0.1:5432")},
+	{Network: "udp", Address: netip.MustParseAddrPort("[::1]:5353")},
+}})
+sockets, err := s.LoopbackSockets() // a listening TCP / bound UDP socket each
+```
+
+The helper binds each socket inside the session network namespace, after
+loopback is up and before any command runs, and hands it over with the TUN.
+A socket keeps belonging to the namespace it was created in, so the caller
+accepts connections and reads datagrams on it from its own namespace,
+without `setns`; whatever the caller then dials is opened in the caller's
+namespace. Session processes see an ordinary connection to the address they
+used, and UDP replies come from that address. The sockets are
+close-on-exec, never reach session processes and close with the session.
+IPv4 and IPv6 are separate endpoints (`IPV6_V6ONLY`); ports below 1024 work
+because the helper briefly holds `CAP_NET_BIND_SERVICE` in its own user
+namespace. Up to 64 forwards per session; a reserved endpoint is in use for
+session processes (`EADDRINUSE`), and unreserved ports stay ordinary session
+loopback.
+
+Why not NAT: redirecting `127.0.0.1` through the TUN with an nftables
+`output` DNAT (plus SNAT to the session address) works for IPv4 only with
+`route_localnet`, and **cannot work for IPv6**. After the reverse
+translation, the reply's destination is `::1` on a non-loopback device, and
+the kernel drops it (`Ip6InAddrErrors`; IPv6 has no `route_localnet`). This
+was measured on Linux 7.2. Sockets in the namespace serve both families the
+same way and need no nftables, sysctl or route.
+
 ## Process containment
 
 Every session has a PID namespace. `Session.Close` kills PID 1; the kernel

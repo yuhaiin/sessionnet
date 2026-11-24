@@ -40,6 +40,8 @@ func TestMain(m *testing.M) {
 		os.Exit(runNestDeeper())
 	case mode == "manual-parent":
 		os.Exit(runManualParent())
+	case mode == "loopback-client":
+		os.Exit(runLoopbackClient())
 	case mode == "listen":
 		os.Exit(runListener())
 	default:

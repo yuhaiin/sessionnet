@@ -36,10 +36,12 @@ type Session struct {
 	// uidMap and gidMap translate session IDs into the caller's namespace;
 	// nil in rootful mode, whose session runs in the caller's namespace.
 	uidMap, gidMap IDMap
-	cgroup         *sessionCgroup
-	ctx            context.Context
-	initial        *Config
-	timings        SetupTimings
+	// loopback holds the sockets of Config.LoopbackForwards.
+	loopback []LoopbackSocket
+	cgroup   *sessionCgroup
+	ctx      context.Context
+	initial  *Config
+	timings  SetupTimings
 
 	helperDone chan struct{}
 	readerDone chan struct{}
@@ -131,6 +133,9 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateLoopbackForwards(cfg.LoopbackForwards); err != nil {
+		return nil, &SetupError{Stage: StageLoopbackForward, Message: "Loopback forwarding is misconfigured: " + strings.TrimPrefix(err.Error(), "sessionnet: "), Err: err}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -186,7 +191,7 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 		// setup needs; the helper clears all of them before running anything
 		// on behalf of the session.
 		helper.SysProcAttr.AmbientCaps = []uintptr{unix.CAP_NET_ADMIN, unix.CAP_SYS_ADMIN,
-			unix.CAP_SETUID, unix.CAP_SETGID, unix.CAP_SETPCAP}
+			unix.CAP_SETUID, unix.CAP_SETGID, unix.CAP_SETPCAP, unix.CAP_NET_BIND_SERVICE}
 	}
 	helper.SysProcAttr.Cloneflags = flags
 	if group != nil {
@@ -243,6 +248,7 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 	if cfg.IPv6 {
 		init.SessionIPv6, init.GatewayIPv6 = addresses.SessionIPv6.String(), addresses.GatewayIPv6.String()
 	}
+	init.LoopbackForwards = wireLoopbackForwards(cfg.LoopbackForwards)
 	if err = ctl.send(&message{Op: opInit, Init: init}); err != nil {
 		return nil, s.setupFailure(ctx, err)
 	}
@@ -254,11 +260,14 @@ func Open(ctx context.Context, cfg Config) (_ *Session, err error) {
 		closeFiles(files)
 		return nil, annotate(mode, ready.Error.toError())
 	}
-	if ready.Op != opReady || len(files) != 3 {
+	if ready.Op != opReady || len(files) != 3+len(cfg.LoopbackForwards) {
 		closeFiles(files)
 		return nil, &SetupError{Stage: StageHandshake, Message: "the session helper sent an invalid handshake"}
 	}
 	s.tun, s.diag, s.netns = files[0], files[1], files[2]
+	for i, f := range cfg.LoopbackForwards {
+		s.loopback = append(s.loopback, LoopbackSocket{Forward: f, File: files[3+i]})
+	}
 	if mode == ModeRootless {
 		if err = verifyInsideIdentity(ready.Ready, cred, plan); err != nil {
 			return nil, err
@@ -328,6 +337,9 @@ func (s *Session) abortSetup() {
 	<-s.helperDone
 	_ = s.ctl.Close()
 	closeFiles([]*os.File{s.tun, s.diag, s.netns})
+	for _, sock := range s.loopback {
+		_ = sock.File.Close()
+	}
 }
 
 // readLoop dispatches supervisor messages until the control socket closes.
@@ -538,6 +550,9 @@ func (s *Session) Close() error {
 		s.closeErr = errors.Join(s.closeErr, s.ctl.Close())
 		<-s.readerDone
 		s.closeErr = errors.Join(s.closeErr, s.tun.Close(), s.diag.Close(), s.netns.Close())
+		for _, sock := range s.loopback {
+			s.closeErr = errors.Join(s.closeErr, sock.File.Close())
+		}
 		if s.initial != nil {
 			s.finishSession(ErrSupervisorExited)
 		}
