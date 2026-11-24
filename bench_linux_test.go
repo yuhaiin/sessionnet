@@ -183,3 +183,15 @@ func nssUsable() bool {
 	var stat unix.Stat_t
 	return unix.Stat("/etc/nsswitch.conf", &stat) == nil && stat.Nlink != 0
 }
+
+// BenchmarkInspectUserNamespace measures the uncached namespace inspection.
+// In the initial namespace it only reads /proc; nested (for example under
+// `podman unshare`) it includes the depth probe, which CurrentUserNamespace
+// runs once per process.
+func BenchmarkInspectUserNamespace(b *testing.B) {
+	for b.Loop() {
+		if _, err := inspectUserNamespace("/proc/self/exe"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

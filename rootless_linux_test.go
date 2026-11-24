@@ -36,6 +36,10 @@ func TestMain(m *testing.M) {
 		os.Exit(runFailureScenario(strings.TrimPrefix(mode, "scenario:")))
 	case mode == "crash-parent":
 		os.Exit(runCrashParent())
+	case mode == "nest-deeper":
+		os.Exit(runNestDeeper())
+	case mode == "manual-parent":
+		os.Exit(runManualParent())
 	case mode == "listen":
 		os.Exit(runListener())
 	default:
@@ -195,9 +199,14 @@ func TestRootlessSessionNamespaces(t *testing.T) {
 			t.Errorf("session shares the host %s namespace %s", fields[1], fields[2])
 		}
 	}
+	// The session runs as the caller's host identity, mapped to the caller's
+	// own UID/GID (an identity map in the initial namespace, "1009 0 1"
+	// under `podman unshare`).
+	cred := s.Credential()
 	for _, want := range []string{
-		fmt.Sprintf("uid %d gid %d", os.Geteuid(), os.Getegid()),
-		fmt.Sprintf("map %d %d 1", os.Geteuid(), os.Geteuid()),
+		fmt.Sprintf("uid %d gid %d", cred.UID, cred.GID),
+		fmt.Sprintf("map %d %d 1", cred.UID, os.Geteuid()),
+		fmt.Sprintf("map %d %d 1", cred.GID, os.Getegid()),
 		"sessionnet0\t00000000", // IPv4 default route
 		"fd427d2a9b3100000000000000000002",
 		"nameserver " + GatewayIPv4, "nameserver " + GatewayIPv6,
@@ -322,8 +331,19 @@ func TestRootlessDiagnosticSocket(t *testing.T) {
 		t.Fatalf("sock_diag socket sees the host listener %d", hostPort)
 	}
 	for i, p := range ports {
-		if p == uint16(port) && uids[i] != uint32(os.Geteuid()) {
-			t.Fatalf("listener owner UID %d, want identity-mapped %d", uids[i], os.Geteuid())
+		if p != uint16(port) {
+			continue
+		}
+		// sock_diag reports the owner in the session's user namespace;
+		// UIDToCaller makes it comparable with /proc owners.
+		if uids[i] != s.Credential().UID {
+			t.Fatalf("listener owner UID %d, want the session UID %d", uids[i], s.Credential().UID)
+		}
+		if caller, ok := s.UIDToCaller(uids[i]); !ok || caller != uint32(os.Geteuid()) {
+			t.Fatalf("UIDToCaller(%d) = %d, %v; want %d", uids[i], caller, ok, os.Geteuid())
+		}
+		if _, ok := s.UIDToCaller(uids[i] + 1); ok {
+			t.Fatal("UIDToCaller must refuse UIDs the session does not map")
 		}
 	}
 	ns, err := s.DupNetNS()

@@ -28,11 +28,13 @@ credential switch differ.
    `CLONE_NEWUSER` when rootless). The package dispatches the helper from an
    `init` function, so the integrating binary needs no change to `main`.
 2. Rootless: while the helper waits on its `SOCK_SEQPACKET` control socket,
-   the parent writes identity UID/GID maps. It writes them directly for its
-   own IDs (denying `setgroups`), or for any ID when it has `CAP_SETUID`/
-   `CAP_SETGID`; subordinate IDs from `/etc/subuid`/`/etc/subgid` use
-   `newuidmap`/`newgidmap`, which are optional. Unmappable IDs fail before
-   anything is started.
+   the parent writes the UID/GID maps (see [Credentials](#credentials)):
+   each session ID is mapped to the ID of the caller's namespace it stands
+   for. It writes them directly for its own IDs (denying `setgroups`), or for
+   any ID of its namespace when it has `CAP_SETUID`/`CAP_SETGID`;
+   subordinate IDs from `/etc/subuid`/`/etc/subgid` use
+   `newuidmap`/`newgidmap` (initial namespace only), which are optional.
+   Unmappable IDs fail before anything is started.
 3. The helper, using capabilities of its own user namespace only, makes
    mounts private, bind-mounts a session `resolv.conf` (and optionally an
    `nsswitch.conf` with `hosts: files dns`) from an anonymous tmpfs, mounts a
@@ -89,13 +91,87 @@ selects others. Loopback stays inside the session.
 
 ## Credentials
 
-In rootless mode the default credential is the caller's effective UID/GID,
-and every ID is identity-mapped, so file ownership keeps its host meaning.
-An unprivileged caller cannot call `setgroups` for the session (the kernel
-requires it to be denied), so the session **inherits the caller's
-supplementary groups**; `Credential.Groups` must then be empty. A caller
-with `CAP_SETGID`, or `newgidmap`, replaces them. Rootful sessions require
-an explicit non-root credential and always replace groups.
+`Credential` IDs are **host IDs**: IDs of the initial user namespace. This
+matters when the caller itself runs in a user namespace, for example under
+`podman unshare`:
+
+```
+caller (podman unshare)   uid_map  0 1009 1 / 1 689824 65536
+session for host UID 1009 uid_map  1009 0 1
+```
+
+The session process is UID 1009 inside, which is UID 0 of the caller's
+namespace, which is host UID 1009. Files keep their host owners and are
+shown under their host IDs and `/etc/passwd` names, and access is decided
+exactly as for host UID 1009. An identity map (`1009 1009 1`) would instead
+run the session as host UID 690832 (the caller's namespace UID 1009) and
+show the user's files as `nobody`.
+
+The second column of `/proc/self/uid_map` is an ID of the *parent*
+namespace, which is the host only for a direct child of the initial
+namespace. `CurrentUserNamespace` therefore measures the nesting depth: the
+kernel allows nesting up to level 33, so the number of further levels a
+chain of helper processes can create is `33 - depth`. A limit or policy can
+only stop the chain early, never make a namespace look shallower. Results:
+
+| Caller | Session IDs | Usable IDs |
+|---|---|---|
+| Initial namespace (native) | host IDs (identity map) | own; any with `CAP_SETUID`/`CAP_SETGID`; `/etc/subuid` via `newuidmap` |
+| Depth 1 (`podman unshare`, `unshare -U`, rootless containers) | host IDs, translated through the caller's map | own; any ID the caller's map covers with `CAP_SETUID`/`CAP_SETGID` |
+| Deeper or unmeasurable | the caller's namespace IDs | the caller's own identity only (nothing else can be verified), unless `ParentUID`/`ParentGID` name the parent IDs explicitly |
+
+IDs that cannot be translated are rejected with a `uid-map`/`gid-map`
+`SetupError`; nothing is guessed or substituted. The pure functions
+`ParseIDMap`, `IDMap.ToParent`/`FromParent`, `ResolveIDChain` and
+`LookupIDChain` implement the translation. Mapping UID 0 of the caller's
+namespace (the Podman case) needs `CAP_SETFCAP` there (Linux 5.12+), which
+namespace root normally holds.
+
+### Manual parent namespace IDs
+
+Deeper nesting is not a kernel limit. Writing a child map needs only IDs of
+the writer's own namespace (the session's immediate parent), and the kernel
+checks those itself; what a nested process cannot do is *see* what they are
+on the host. `Credential.ParentUID`/`ParentGID` therefore let the caller
+state the pairing directly, keeping the session (target) IDs separate:
+
+```
+Credential{UID: 1009, GID: 1009, ParentUID: &zero, ParentGID: &zero}
+-> session uid_map "1009 0 1", gid_map "1009 0 1"
+```
+
+They are IDs of the caller's namespace, never host IDs. They must exist in
+the caller's `uid_map`/`gid_map`, they go through the same permission rules
+as automatic IDs (own ID, or `CAP_SETUID`/`CAP_SETGID`; `CAP_SETFCAP` for the
+caller's UID 0; another GID needs a namespace that allows `setgroups`), and
+where host IDs are resolvable an override must agree with the automatic
+result. The kernel rejects anything else. `Inspect` lists the usable parent
+IDs (`ParentUIDRanges`, `ParentGIDRanges`). Rootful sessions refuse them.
+
+For every rootless session the helper reads `/proc/self/uid_map`, `gid_map`
+and its real/effective/saved IDs inside the session after switching to them,
+and `Open` fails unless they equal the plan.
+
+The rootless default credential (`DefaultCredential`, or a nil
+`Config.Credential`) is the caller's own identity. It **keeps the caller's
+supplementary groups**: `setgroups` is denied in the session and the kernel
+retains every group, including groups the caller's namespace does not map.
+Those appear as `nogroup` (65534) but still grant their access, which is the
+only way an unprivileged process can preserve them. A credential with a
+different UID/GID replaces the groups with `Credential.Groups` when the
+caller holds `CAP_SETGID` and its namespace allows `setgroups`, or via
+`newgidmap`; otherwise `Credential.Groups` must be empty and the caller's
+groups are inherited (only when the GID is the caller's own). If the
+caller's own namespace has `setgroups` denied, no session can set groups.
+
+Rootful sessions run in the caller's namespace: the host IDs are translated
+into it, and neither the host IDs nor the translated IDs may be 0.
+
+`Inspect` reports the namespace, the caller's identity and capabilities, the
+usable ID ranges, and verifies a probe session through the kernel
+(`Session.Identity` reads the supervisor's `/proc` entries as the caller sees
+them). `Session.UIDToCaller` translates socket owners reported by `DupDiag`
+(session IDs) into the caller's namespace, where `/proc` shows owners.
 
 Session processes have no capabilities, an empty bounding set and
 `no_new_privs`; setuid programs do not gain privilege.
@@ -148,7 +224,28 @@ SESSIONNET_REQUIRE_ROOTLESS=1 go test -v ./...   # fail instead of skip
 ```
 
 Rootless tests skip, with the reason, only when the host cannot create
-rootless sessions. Failure handling (disabled user/PID/network namespaces,
+rootless sessions. `TestNestedNamespaceIdentity` runs sessions from a
+namespace whose root is the test user (Podman's layout) and checks file
+ownership, read/write/exec, traversal, creation, deletion and denied access
+through the kernel. Under real Podman:
+
+```bash
+go test -c -o sessionnet.test .
+podman unshare env SESSIONNET_REQUIRE_INHERITED=1 SESSIONNET_EXPECT_HOST_UID=$(id -u) \
+    SESSIONNET_EXPECT_HOST_GID=$(id -g) SESSIONNET_GROUP_DIR=/srv/group-only \
+    SESSIONNET_DENIED_DIR=/root ./sessionnet.test -test.run InPlace -test.v
+```
+
+`TestDeeperNamespaceManualParent` builds a two-level hierarchy (test user →
+`0 <uid> 1` → `0 0 1`) and checks that host IDs are refused there while a
+manual parent override gives the expected map and file access. In place,
+one namespace below Podman:
+
+```bash
+podman unshare unshare --user --map-root-user env SESSIONNET_REQUIRE_DEEPER=1 \
+    SESSIONNET_EXPECT_HOST_UID=$(id -u) SESSIONNET_EXPECT_HOST_GID=$(id -g) \
+    ./sessionnet.test -test.run DeeperNamespaceInPlace -test.v
+``` Failure handling (disabled user/PID/network namespaces,
 missing, inaccessible or invalid TUN, rejected UID/GID maps, cancellation)
 is tested in nested user namespaces, and rootful mode runs as root of a
 `newuidmap` namespace, so none of it needs host root. `TestRootfulModeAsRoot`

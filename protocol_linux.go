@@ -71,6 +71,12 @@ type readyReply struct {
 	TUN         int64 `json:"tun"`
 	Network     int64 `json:"network"`
 	Diagnostics int64 `json:"diagnostics"`
+	// What the helper reads inside the session after adopting its IDs:
+	// /proc/self/uid_map, gid_map and its real, effective and saved IDs.
+	UIDMap string   `json:"uidMap,omitempty"`
+	GIDMap string   `json:"gidMap,omitempty"`
+	UIDs   []uint32 `json:"uids,omitempty"`
+	GIDs   []uint32 `json:"gids,omitempty"`
 }
 
 type spawnRequest struct {

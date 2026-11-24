@@ -132,15 +132,33 @@ func (m Mode) Resolve() (Mode, error) {
 	}
 }
 
-// Credential names a non-root Unix user. In rootful mode, and in rootless
-// mode when the caller may call setgroups(2) for the session (it is root, or
-// newgidmap mapped the group), supplementary groups are replaced with Groups.
-// Otherwise the kernel forbids setgroups in the user namespace, the session
-// inherits the caller's supplementary groups and Groups must be empty.
+// Credential names the Unix identity of session processes by host IDs: IDs
+// of the initial user namespace, also when the caller runs inside a user
+// namespace (see README "Credentials"). When the caller's namespace cannot
+// be resolved to the host, they are IDs of the caller's namespace and only
+// the caller's own identity is accepted. Unmappable IDs are rejected.
+//
+// A rootless session with the caller's own identity and no Groups keeps the
+// caller's supplementary groups. Otherwise, in rootful mode and in rootless
+// mode when the caller may call setgroups(2) for the session (CAP_SETGID in
+// a namespace that allows it, or newgidmap), supplementary groups are
+// replaced with Groups; if not, Groups must be empty and the caller's groups
+// are inherited.
 type Credential struct {
 	UID    uint32
 	GID    uint32
 	Groups []uint32
+	// ParentUID and ParentGID optionally name, for rootless sessions, the IDs
+	// of the caller's own user namespace (the session's immediate parent)
+	// that UID and GID map to, instead of the automatic translation. They
+	// are IDs of that namespace, never host IDs: under `podman unshare`
+	// session UID 1009 has parent UID 0. Use them only when the automatic
+	// translation cannot resolve the caller's namespace (it is nested more
+	// than one level deep); where it can, an override must agree with it.
+	// The kernel still decides whether the caller may map the ID, and the
+	// session verifies the result from inside.
+	ParentUID *uint32
+	ParentGID *uint32
 }
 
 // Config describes an isolated session. Its network namespace has no host

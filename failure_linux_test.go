@@ -89,8 +89,12 @@ func runScenario(t *testing.T, name string, outer outerNamespace, caps ...uintpt
 
 func mapSubordinate(pid int) error {
 	uid := os.Geteuid()
-	subUID := readSubordinateIDs("/etc/subuid", currentIdentity().username, uint32(uid))
-	subGID := readSubordinateIDs("/etc/subgid", currentIdentity().username, uint32(uid))
+	self, err := currentIdentity()
+	if err != nil {
+		return err
+	}
+	subUID := readSubordinateIDs("/etc/subuid", self.username, uint32(uid))
+	subGID := readSubordinateIDs("/etc/subgid", self.username, uint32(uid))
 	if len(subUID) == 0 || len(subGID) == 0 || subUID[0].count < 2000 || subGID[0].count < 2000 {
 		return errors.New("no /etc/subuid and /etc/subgid range of at least 2000 IDs")
 	}
@@ -171,8 +175,8 @@ func runFailureScenario(name string) int {
 		}
 		return report(Probe(ctx, Config{}), "")
 	case "uid-map-rejected":
-		// CAP_SETUID makes the planner write the map itself; the kernel
-		// rejects it because the UID is not mapped in this namespace.
+		// The host UID is not mapped into this namespace, so the planner
+		// refuses it before any helper starts.
 		return report(Probe(ctx, Config{Credential: &Credential{UID: self.UID + 1000, GID: self.GID}}), "")
 	case "gid-map-rejected":
 		return report(Probe(ctx, Config{Credential: &Credential{UID: self.UID, GID: self.GID + 1000}}), "")
@@ -191,12 +195,24 @@ func runFailureScenario(name string) int {
 		}
 		return sessionOutput(ctx, Config{}, "cat /etc/resolv.conf")
 	case "privileged-rootless":
-		// A root-owned Yuhaiin: the session must run as UID 1000 with its
-		// supplementary groups replaced instead of inherited.
-		return sessionOutput(ctx, Config{Credential: &Credential{UID: 1000, GID: 1000}}, "id -u; id -G; grep -E '^(CapEff|CapBnd)' /proc/self/status")
+		// A root-owned Yuhaiin: the session must run as the host IDs of
+		// namespace UID/GID 1000 with its supplementary groups replaced
+		// instead of inherited.
+		cred, err := hostCredential(1000, 1000)
+		if err != nil {
+			return report(err, "")
+		}
+		return sessionOutput(ctx, Config{Credential: &cred}, fmt.Sprintf("echo want=%d; id -u; id -G; grep -E '^(CapEff|CapBnd)' /proc/self/status", cred.UID))
 	case "rootful":
-		return sessionOutput(ctx, Config{Mode: ModeRootful, IPv6: true, Credential: &Credential{UID: 1000, GID: 1000}},
+		// Rootful sessions run in this namespace, as its UID/GID 1000.
+		cred, err := hostCredential(1000, 1000)
+		if err != nil {
+			return report(err, "")
+		}
+		return sessionOutput(ctx, Config{Mode: ModeRootful, IPv6: true, Credential: &cred},
 			"id -u; id -G; grep -E '^(CapEff|CapBnd|NoNewPrivs)' /proc/self/status /proc/1/status; cat /proc/net/route; cat /etc/resolv.conf; echo pid=$$\n"+processTree)
+	case "inherited":
+		return inheritedScenario(ctx)
 	case "bench-modes":
 		out, err := benchModes()
 		return report(err, out)
@@ -204,6 +220,20 @@ func runFailureScenario(name string) int {
 		return report(Probe(ctx, Config{Mode: ModeRootful, Credential: &Credential{UID: self.UID, GID: self.GID}}), "")
 	}
 	return report(fmt.Errorf("unknown scenario %q", name), "")
+}
+
+// hostCredential names namespace IDs by their host IDs, as a Credential does.
+func hostCredential(uid, gid uint32) (Credential, error) {
+	ns, err := CurrentUserNamespace()
+	if err != nil {
+		return Credential{}, err
+	}
+	hostUID, ok1 := ns.HostUID(uid)
+	hostGID, ok2 := ns.HostGID(gid)
+	if !ok1 || !ok2 {
+		return Credential{}, fmt.Errorf("namespace IDs %d:%d have no host IDs (depth %d)", uid, gid, ns.Depth)
+	}
+	return Credential{UID: hostUID, GID: hostGID}, nil
 }
 
 // bindSymlinkOverResolver makes /etc/resolv.conf resolve through link. A
@@ -312,15 +342,18 @@ func TestFailureGIDMappingRejected(t *testing.T) {
 
 func TestFailureUnmappableUID(t *testing.T) {
 	requireRootless(t)
-	self := currentIdentity()
-	if self.canSetUID {
+	self, err := currentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if self.CapSetUID {
 		t.Skip("the caller may map any UID")
 	}
-	uid := self.uid + 1
+	uid := self.UID + 1
 	for inRanges(self.subUIDs, uid) {
 		uid++
 	}
-	err := Probe(context.Background(), Config{Credential: &Credential{UID: uid, GID: self.gid}})
+	err = Probe(context.Background(), Config{Credential: &Credential{UID: uid, GID: self.GID}})
 	var setup *SetupError
 	if !errors.As(err, &setup) || setup.Stage != StageUIDMap || !strings.Contains(setup.Message, "UID mapping failed") {
 		t.Fatalf("unmappable UID: %v", err)
@@ -331,6 +364,12 @@ func TestFailureUnmappableUID(t *testing.T) {
 }
 
 func TestFailureRootfulWithoutPrivileges(t *testing.T) {
+	if os.Geteuid() == 0 {
+		// Root (also root of a namespace such as `podman unshare`) keeps its
+		// capabilities in the scenario namespace, so the refusal under test
+		// cannot occur.
+		t.Skip("requires a caller that is not root of its user namespace")
+	}
 	r := runScenario(t, "rootful-unprivileged", outerIdentity)
 	expectFailure(t, r, StageNamespaces, "Rootful mode requires root privileges")
 }
@@ -348,7 +387,7 @@ func TestRootlessPrivilegedCallerReplacesGroups(t *testing.T) {
 		t.Fatalf("%+v", r)
 	}
 	lines := strings.Split(r.Output, "\n")
-	if len(lines) < 4 || lines[0] != "1000" || lines[1] != "1000" ||
+	if len(lines) < 5 || lines[0] != "want="+lines[1] || lines[2] != lines[1] ||
 		!strings.Contains(r.Output, "CapEff:\t0000000000000000") || !strings.Contains(r.Output, "CapBnd:\t0000000000000000") {
 		t.Fatalf("privileged rootless session: %q", r.Output)
 	}

@@ -28,3 +28,18 @@ func (*Session) Release() error              { return ErrUnsupported }
 func (*Session) Done() <-chan struct{}       { return nil }
 func (*Session) Wait() error                 { return ErrUnsupported }
 func (*Session) Close() error                { return nil }
+
+// Identity reports that the Linux isolation backend is unavailable.
+func (*Session) Identity() (SessionIdentity, error)   { return SessionIdentity{}, ErrUnsupported }
+func (*Session) UIDToCaller(id uint32) (uint32, bool) { return id, false }
+
+// CurrentUserNamespace reports that user namespaces are Linux-only.
+func CurrentUserNamespace() (UserNamespace, error) { return UserNamespace{}, ErrUnsupported }
+
+// DefaultCredential reports that the Linux isolation backend is unavailable.
+func DefaultCredential() (Credential, error) { return Credential{}, ErrUnsupported }
+
+// Inspect reports that the Linux isolation backend is unavailable.
+func Inspect(_ context.Context, cfg Config) Report {
+	return Report{Mode: cfg.Mode, Error: &SetupError{Stage: StageHelper, Message: "isolated sessions require Linux", Err: ErrUnsupported}}
+}

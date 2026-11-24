@@ -32,6 +32,9 @@ func init() {
 	if len(os.Args) >= 2 && os.Args[1] == helperArg {
 		os.Exit(helperMain(os.Args[2:]))
 	}
+	if len(os.Args) == 2 && os.Args[0] == helperArgv0 && os.Args[1] == helperLevelArg {
+		os.Exit(nestingLevelMain())
+	}
 }
 
 func helperMain(args []string) int {
@@ -94,6 +97,9 @@ func setupSession(conn *controlConn, req *initRequest) error {
 		// The parent has mapped exactly the session IDs. Adopt them on every
 		// thread first, so files created during setup are owned by mapped IDs.
 		if err := adoptCredentials(req); err != nil {
+			return err
+		}
+		if err := reportInsideIdentity(reply); err != nil {
 			return err
 		}
 	}
@@ -162,6 +168,22 @@ func adoptCredentials(req *initRequest) error {
 			return fail(StageUIDMap, fmt.Sprintf("UID %d is not usable inside the user namespace", req.UID), err)
 		}
 	}
+	return nil
+}
+
+// reportInsideIdentity records the maps and IDs as the session itself sees
+// them, so the parent can verify the result rather than trust its plan.
+func reportInsideIdentity(reply *readyReply) error {
+	uidMap, err1 := os.ReadFile("/proc/self/uid_map")
+	gidMap, err2 := os.ReadFile("/proc/self/gid_map")
+	if err := errors.Join(err1, err2); err != nil {
+		return fail(StageUIDMap, "cannot read the ID maps inside the session", err)
+	}
+	reply.UIDMap, reply.GIDMap = string(uidMap), string(gidMap)
+	r, e, s := unix.Getresuid()
+	reply.UIDs = []uint32{uint32(r), uint32(e), uint32(s)}
+	r, e, s = unix.Getresgid()
+	reply.GIDs = []uint32{uint32(r), uint32(e), uint32(s)}
 	return nil
 }
 
